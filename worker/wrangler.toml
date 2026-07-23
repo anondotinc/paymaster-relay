@@ -1,0 +1,9 @@
+name = "anon-ohttp-relay"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+routes = [
+  { pattern = "relay.anon.inc", custom_domain = true }
+]
+
+[vars]
+TARGET = "https://api.anon.inc"

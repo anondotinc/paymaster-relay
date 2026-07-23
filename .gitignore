@@ -1,0 +1,9 @@
+# compiled binary (from `go build .` — module basename is paymaster-relay)
+/paymaster-relay
+/anon-ohttp-relay
+# test/coverage artifacts
+*.test
+*.out
+
+# Wrangler local state and build output
+.wrangler/
