@@ -56,6 +56,7 @@ var publicReadPaths = []string{
 func New(gatewayURL string, client *http.Client) http.Handler {
 	mux := http.NewServeMux()
 	cache := newTTLCache()
+	safeguards := newRelaySafeguards()
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 
@@ -76,7 +77,7 @@ func New(gatewayURL string, client *http.Client) http.Handler {
 		})
 	}
 
-	mux.HandleFunc("POST /gateway", func(w http.ResponseWriter, r *http.Request) {
+	gateway := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var (
 			body []byte
 			req  *http.Request
@@ -87,8 +88,13 @@ func New(gatewayURL string, client *http.Client) http.Handler {
 			http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
 			return
 		}
-		body, err = io.ReadAll(io.LimitReader(r.Body, maxBody))
+		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+		body, err = io.ReadAll(r.Body)
 		if err != nil {
+			if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
@@ -99,16 +105,26 @@ func New(gatewayURL string, client *http.Client) http.Handler {
 			return
 		}
 		req.Header.Set("Content-Type", ctReq)
+		// Suppress net/http's generic User-Agent too. It is not copied from the
+		// caller, but omitting it keeps gateway telemetry entirely free of a
+		// user-agent dimension and makes this allowlist exact.
+		req.Header.Set("User-Agent", "")
 		resp, err = client.Do(req)
 		if err != nil {
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+		if readErr != nil || len(responseBody) > maxBody {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
 		w.Header().Set("Content-Type", ctRes)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, io.LimitReader(resp.Body, maxBody))
+		_, _ = w.Write(responseBody)
 	})
+	mux.Handle("POST /gateway", safeguards.gateway(gateway))
 
 	return withCORS(mux)
 }
@@ -130,6 +146,10 @@ func proxyGet(client *http.Client, cache *ttlCache, url string, w http.ResponseW
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
+	// proxyGet reconstructs an identity-free request. Explicitly suppress the
+	// default Go User-Agent so public quote/token telemetry has no user-agent
+	// field even though the caller's headers were already omitted.
+	req.Header.Set("User-Agent", "")
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)

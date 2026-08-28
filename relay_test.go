@@ -10,6 +10,38 @@ import (
 	"time"
 )
 
+var clientIdentityHeaderNames = []string{
+	"Authorization",
+	"X-Anon-Client",
+	"X-Anon-Node",
+	"Origin",
+	"Referer",
+	"User-Agent",
+	"Forwarded",
+	"X-Forwarded-For",
+	"X-Real-IP",
+	"CF-Connecting-IP",
+	"True-Client-IP",
+	"X-Client-IP",
+	"X-Platform",
+}
+
+func addClientIdentityHeaders(request *http.Request) {
+	for _, name := range clientIdentityHeaderNames {
+		request.Header.Set(name, "client-identity")
+	}
+}
+
+func assertNoClientIdentityHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+	for _, name := range clientIdentityHeaderNames {
+		var value = header.Get(name)
+		if value != "" {
+			t.Errorf("client identity header %s reached paymaster: %q", name, value)
+		}
+	}
+}
+
 // TestGatewayForwards asserts POST /gateway forwards the encapsulated body and
 // its Content-Type to the fixed gateway, and relays the gateway's
 // message/ohttp-res response back unchanged.
@@ -26,6 +58,7 @@ func TestGatewayForwards(t *testing.T) {
 		gotPath = r.URL.Path
 		gotCT = r.Header.Get("Content-Type")
 		gotBody, _ = io.ReadAll(r.Body)
+		assertNoClientIdentityHeaders(t, r.Header)
 		w.Header().Set("Content-Type", ctRes)
 		_, _ = w.Write([]byte(resBody))
 	}))
@@ -34,7 +67,13 @@ func TestGatewayForwards(t *testing.T) {
 	relay := httptest.NewServer(New(backend.URL, http.DefaultClient))
 	defer relay.Close()
 
-	resp, err := http.Post(relay.URL+"/gateway", ctReq, bytes.NewReader([]byte(reqBody)))
+	req, err := http.NewRequest(http.MethodPost, relay.URL+"/gateway", bytes.NewReader([]byte(reqBody)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", ctReq)
+	addClientIdentityHeaders(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +97,65 @@ func TestGatewayForwards(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != resBody {
 		t.Fatalf("relay response body = %q, want %q", body, resBody)
+	}
+}
+
+func TestGatewayRejectsOversizedRequest(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("gateway must not receive oversized requests")
+	}))
+	defer backend.Close()
+	relay := httptest.NewServer(New(backend.URL, http.DefaultClient))
+	defer relay.Close()
+
+	resp, err := http.Post(relay.URL+"/gateway", ctReq, bytes.NewReader(make([]byte, maxBody+1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+func TestGatewayRateLimitIsEphemeralAndSourceScoped(t *testing.T) {
+	s := newRelaySafeguards()
+	now := time.Unix(1_700_000_000, 0)
+	for i := 0; i < maxSourceRequestsPerMinute; i++ {
+		if !s.allow("192.0.2.1:1234", now) {
+			t.Fatalf("request %d rejected before limit", i+1)
+		}
+	}
+	if s.allow("192.0.2.1:9999", now) {
+		t.Fatal("same source should be limited regardless of port")
+	}
+	if !s.allow("192.0.2.2:1234", now) {
+		t.Fatal("different source should have an independent window")
+	}
+	if !s.allow("192.0.2.1:1234", now.Add(time.Minute)) {
+		t.Fatal("source window should reset without persistence")
+	}
+}
+
+func TestGatewayTimeout(t *testing.T) {
+	previous := gatewayRequestTimeout
+	gatewayRequestTimeout = 10 * time.Millisecond
+	defer func() { gatewayRequestTimeout = previous }()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	relay := httptest.NewServer(New(backend.URL, http.DefaultClient))
+	defer relay.Close()
+
+	resp, err := http.Post(relay.URL+"/gateway", ctReq, bytes.NewReader([]byte("sealed")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
 }
 
@@ -124,10 +222,18 @@ func TestConfigsProxied(t *testing.T) {
 func TestPublicReadProxied(t *testing.T) {
 	const quoteBody = `{"quoteId":"tok","chainId":"1"}`
 
-	var gotPath, gotQuery string
+	var (
+		gotPath  string
+		gotQuery string
+		paths    = []string{
+			"/api/v1/paymaster/gas-quote?chainId=1&priority=fast",
+			"/api/v1/paymaster/supported-tokens?chainId=1",
+		}
+	)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotQuery = r.URL.RawQuery
+		assertNoClientIdentityHeaders(t, r.Header)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "public, max-age=50")
 		_, _ = w.Write([]byte(quoteBody))
@@ -137,23 +243,36 @@ func TestPublicReadProxied(t *testing.T) {
 	relay := httptest.NewServer(New(backend.URL, http.DefaultClient))
 	defer relay.Close()
 
-	resp, err := http.Get(relay.URL + "/api/v1/paymaster/gas-quote?chainId=1&priority=fast")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if gotPath != "/api/v1/paymaster/gas-quote" {
-		t.Fatalf("forwarded path = %q", gotPath)
-	}
-	if gotQuery != "chainId=1&priority=fast" {
-		t.Fatalf("forwarded query = %q, want chainId=1&priority=fast", gotQuery)
-	}
-	if cc := resp.Header.Get("Cache-Control"); cc != "public, max-age=50" {
-		t.Fatalf("cache-control = %q", cc)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != quoteBody {
-		t.Fatalf("body = %q", body)
+	for _, path := range paths {
+		var (
+			request *http.Request
+			resp    *http.Response
+			body    []byte
+			err     error
+		)
+		request, err = http.NewRequest(http.MethodGet, relay.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addClientIdentityHeaders(request)
+		resp, err = http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if gotPath+"?"+gotQuery != path {
+			t.Fatalf("forwarded target = %q, want %q", gotPath+"?"+gotQuery, path)
+		}
+		if resp.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("content-type = %q", resp.Header.Get("Content-Type"))
+		}
+		if resp.Header.Get("Cache-Control") != "public, max-age=50" {
+			t.Fatalf("cache-control = %q", resp.Header.Get("Cache-Control"))
+		}
+		if string(body) != quoteBody {
+			t.Fatalf("body = %q", body)
+		}
 	}
 }
 

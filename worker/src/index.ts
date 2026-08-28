@@ -13,6 +13,45 @@ export interface Env { TARGET: string } // the paymaster gateway base URL
 // For the strongest guarantee with no such dependency, run the Go+Docker relay
 // (relay.go) — it forwards no client headers at all.
 const STRIP_IP_HEADERS: Record<string, string> = { "X-Real-IP": "0.0.0.0" };
+const MAX_GATEWAY_BODY = 1 << 20;
+const MAX_GATEWAY_CONCURRENCY = 128;
+const MAX_SOURCE_REQUESTS_PER_MINUTE = 60;
+const GATEWAY_TIMEOUT_MS = 20_000;
+
+const sourceWindows = new Map<string, { started: number; count: number }>();
+const sourceSalt = crypto.getRandomValues(new Uint8Array(32));
+let activeGatewayRequests = 0;
+
+async function ephemeralSourceKey(req: Request): Promise<string> {
+  const source = req.headers.get("CF-Connecting-IP") ?? "unknown";
+  const sourceBytes = new TextEncoder().encode(source);
+  const material = new Uint8Array(sourceSalt.length + sourceBytes.length);
+  material.set(sourceSalt);
+  material.set(sourceBytes, sourceSalt.length);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", material));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sourceAllowed(req: Request): Promise<boolean> {
+  const now = Date.now();
+  if (sourceWindows.size > 10_000) {
+    for (const [key, window] of sourceWindows) {
+      if (now - window.started >= 60_000) sourceWindows.delete(key);
+    }
+    if (sourceWindows.size > 10_000) {
+      sourceWindows.delete(sourceWindows.keys().next().value as string);
+    }
+  }
+  const key = await ephemeralSourceKey(req);
+  const window = sourceWindows.get(key);
+  if (!window || now - window.started >= 60_000) {
+    sourceWindows.set(key, { started: now, count: 1 });
+    return true;
+  }
+  if (window.count >= MAX_SOURCE_REQUESTS_PER_MINUTE) return false;
+  window.count += 1;
+  return true;
+}
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -69,15 +108,33 @@ export default {
     if (url.pathname === "/gateway" && req.method === "POST") {
       if (req.headers.get("content-type") !== "message/ohttp-req")
         return withCors(new Response("unsupported media type", { status: 415 }));
+      const contentLength = Number(req.headers.get("content-length") ?? "0");
+      if (Number.isFinite(contentLength) && contentLength > MAX_GATEWAY_BODY)
+        return withCors(new Response("request too large", { status: 413 }));
+      if (!(await sourceAllowed(req)))
+        return withCors(new Response("rate limited", { status: 429, headers: { "Retry-After": "60" } }));
+      if (activeGatewayRequests >= MAX_GATEWAY_CONCURRENCY)
+        return withCors(new Response("relay busy", { status: 503 }));
+      const body = await req.arrayBuffer();
+      if (body.byteLength > MAX_GATEWAY_BODY)
+        return withCors(new Response("request too large", { status: 413 }));
       // Forward only the encapsulated body + content-type; no client headers.
       // (X-Real-IP override suppresses X-Forwarded-For; see the CF-Connecting-IP
       // caveat at the top of this file.)
-      const resp = await fetch(env.TARGET + "/gateway", {
-        method: "POST",
-        headers: { "content-type": "message/ohttp-req", ...STRIP_IP_HEADERS },
-        body: req.body,
-      });
-      return withCors(new Response(resp.body, { status: resp.status, headers: { "content-type": "message/ohttp-res" } }));
+      activeGatewayRequests += 1;
+      try {
+        const resp = await fetch(env.TARGET + "/gateway", {
+          method: "POST",
+          headers: { "content-type": "message/ohttp-req", ...STRIP_IP_HEADERS },
+          body,
+          signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+        });
+        return withCors(new Response(resp.body, { status: resp.status, headers: { "content-type": "message/ohttp-res" } }));
+      } catch {
+        return withCors(new Response("bad gateway", { status: 502 }));
+      } finally {
+        activeGatewayRequests -= 1;
+      }
     }
     return withCors(new Response("not found", { status: 404 }));
   },
