@@ -19,15 +19,23 @@ const MAX_SOURCE_REQUESTS_PER_MINUTE = 60;
 const GATEWAY_TIMEOUT_MS = 20_000;
 
 const sourceWindows = new Map<string, { started: number; count: number }>();
-const sourceSalt = crypto.getRandomValues(new Uint8Array(32));
+// Workers refuse random values in global scope (deploy error 10021), so the
+// per-isolate salt is drawn on the first request instead of at load.
+let sourceSalt: Uint8Array | undefined;
 let activeGatewayRequests = 0;
+
+function isolateSalt(): Uint8Array {
+  sourceSalt ??= crypto.getRandomValues(new Uint8Array(32));
+  return sourceSalt;
+}
 
 async function ephemeralSourceKey(req: Request): Promise<string> {
   const source = req.headers.get("CF-Connecting-IP") ?? "unknown";
   const sourceBytes = new TextEncoder().encode(source);
-  const material = new Uint8Array(sourceSalt.length + sourceBytes.length);
-  material.set(sourceSalt);
-  material.set(sourceBytes, sourceSalt.length);
+  const salt = isolateSalt();
+  const material = new Uint8Array(salt.length + sourceBytes.length);
+  material.set(salt);
+  material.set(sourceBytes, salt.length);
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", material));
   return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
