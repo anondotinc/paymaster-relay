@@ -5,12 +5,12 @@ WORKER_DIR ?= worker
 WRANGLER ?= npx --yes wrangler@4
 RELAY_URL ?= https://relay.anon.inc
 
-.PHONY: help test worker-check check cloudflare-login deploy deploy-worker deploy-cloudflare verify-cloudflare
+.PHONY: help test worker-test worker-check check cloudflare-login deploy deploy-worker deploy-cloudflare verify-cloudflare
 
 help:
 	@echo "Anon OHTTP relay"
 	@echo ""
-	@echo "  make check              Run Go tests and compile the Worker"
+	@echo "  make check              Run Go and Worker tests and compile the Worker"
 	@echo "  make deploy             Validate, deploy to Cloudflare, and verify CORS"
 	@echo "  make verify-cloudflare  Verify the currently deployed relay"
 	@echo "  make cloudflare-login   Authenticate Wrangler in a browser"
@@ -18,10 +18,14 @@ help:
 test:
 	go test ./...
 
+# Worker source tests: Node 22+, no Wrangler, network or credentials.
+worker-test:
+	node --experimental-strip-types --test $(WORKER_DIR)/test/*.test.mjs
+
 worker-check:
 	cd $(WORKER_DIR) && $(WRANGLER) deploy --dry-run
 
-check: test worker-check
+check: test worker-test worker-check
 
 cloudflare-login:
 	cd $(WORKER_DIR) && $(WRANGLER) login

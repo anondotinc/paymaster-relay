@@ -39,18 +39,29 @@ access to paymaster secrets.
   the paymaster's TTL (see **Caching**); `Cache-Control` is preserved so a CDN can
   front them too. (No sealing — they carry no secrets.)
 
-  These two are the paymaster service's only public GET reads. The set lives in
-  `publicReadPaths` (`relay.go`) / `PUBLIC_READ_PATHS` (`worker/src/index.ts`) —
-  add a new public paymaster read by appending one line to each. The allowlist is
-  explicit on purpose: the relay is never an open proxy, and the JWT-scoped
-  `GET /status/{job_id}` is deliberately not exposed (its oblivious counterpart is
-  the sealed `POST /gateway` path).
+  The set lives in `publicReadPaths` (`relay.go`) / `PUBLIC_READ_PATHS`
+  (`worker/src/index.ts`). The allowlist is explicit on purpose: the relay is
+  never an open proxy, and the JWT-scoped `GET /status/{job_id}` is deliberately
+  not exposed (its oblivious counterpart is the sealed `POST /gateway` path).
+- `GET /api/v1/paymaster/gas-tiers?chainId=<id>` and `GET /api/v1/tx/gas-fee/<id>`
+  → the paymaster's gas tiers and the API's network base fee. Both are public,
+  identity-free and **fresh-only** (the API answers
+  `Cache-Control: public, s-maxage=5, max-age=5`). They are strictly validated
+  before anything is forwarded: `<id>` must be exactly `1`, `56`, `137` or
+  `42161`; `gas-tiers` takes exactly one `chainId` (or its protobuf spelling
+  `chain_id`) and no other field; `gas-fee` takes no query and one path segment.
+  Anything else is a `400` (`404` for other paths), never cached. The relay
+  forwards only the canonical target (`?chainId=<id>` / `/<id>`), so no caller
+  query reaches the API or the cache key. API errors (`400` for a chain the
+  paymaster doesn't serve, `503` with no base fee) pass through as `no-store`.
+  The rules live in `gas_reads.go` / `gasReadTarget` (`worker/src/index.ts`);
+  change both together.
 
 ## Caching
 
-The public GET reads (`gas-quote`, `supported-tokens`) and the KeyConfig
-(`/ohttp-configs`) are cached by the relay itself, **honoring the paymaster's
-`Cache-Control`**:
+The public GET reads (`gas-quote`, `supported-tokens`, `gas-tiers`, `gas-fee`)
+and the KeyConfig (`/ohttp-configs`) are cached by the relay itself, **honoring
+the paymaster's `Cache-Control`**:
 
 - A `200` response with `Cache-Control: max-age=N` is cached for `N` seconds and
   served from cache within that window (with an `Age` header). The relay never
@@ -58,14 +69,21 @@ The public GET reads (`gas-quote`, `supported-tokens`) and the KeyConfig
   can't outlive the window the paymaster is willing to honor at execute time.
 - `no-store` / `no-cache` / `private`, or a missing / zero `max-age`, disable
   caching for that response — the relay refetches every time.
+- Errors are never cached by the relay (only `200`s are stored).
+- The Go relay (every read) and the Worker's gas reads also count an upstream
+  `Age` against that lifetime, so neither the relay nor a cache behind it
+  extends the freshness (an invalid or exhausted `Age` makes the response
+  `no-store`), and relay non-`200` answers with `Cache-Control: no-store`.
 - The cache is **shared across clients** (the responses are identity-free), which
   also reduces the request volume the paymaster sees.
 
 The **Go** relay uses a small in-memory TTL cache (`cache.go`); the **Worker**
 uses the Cloudflare edge cache (`caches.default`), which honors origin
-`Cache-Control` automatically. To set the TTL, set `Cache-Control: max-age=…` on
-the paymaster's `gas-quote` / `supported-tokens` responses (≤ its quote validity
-window).
+`Cache-Control` automatically. For the gas reads the Worker rebuilds the
+response headers and stores `public, max-age=<remaining>` (s-maxage or max-age
+minus `Age`), keyed by the canonical target. To set the TTL, set
+`Cache-Control: max-age=…` on the paymaster's `gas-quote` / `supported-tokens`
+responses (≤ its quote validity window).
 
 Both implementations allow public browser access with `Access-Control-Allow-Origin: *`
 and handle `OPTIONS` preflights for the OHTTP `Content-Type`. They do not use
@@ -108,6 +126,7 @@ docker run --rm -p 8080:8080 \
 ```bash
 go build .
 go test ./...
+node --experimental-strip-types --test worker/test/*.test.mjs   # Worker, Node 22+
 ```
 
 ## Cloudflare Worker variant
@@ -122,10 +141,10 @@ preflight with:
 make deploy
 ```
 
-The target runs `go test ./...`, performs a Wrangler dry run, deploys the custom
-domain from `worker/wrangler.toml`, and checks the live `/health` and
-`OPTIONS /gateway` responses. Run `make cloudflare-login` first if Wrangler is
-not authenticated.
+The target runs `go test ./...` and the Worker tests, performs a Wrangler dry
+run, deploys the custom domain from `worker/wrangler.toml`, and checks the live
+`/health` and `OPTIONS /gateway` responses. Run `make cloudflare-login` first if
+Wrangler is not authenticated.
 
 The checked-in Worker configuration deploys Anon's production relay. To deploy
 from another Cloudflare account, fork this repository and change all three of:
