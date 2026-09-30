@@ -78,6 +78,92 @@ const PUBLIC_READ_PATHS = new Set<string>([
   "/api/v1/paymaster/supported-tokens",
 ]);
 
+// Public gas reads: the paymaster's gas tiers and the API's network base fee.
+// Both are identity-free and fresh-only (the API answers
+// "public, s-maxage=5, max-age=5"). Unlike the verbatim reads above, the relay
+// forwards ONLY a validated, canonical chainId on a fixed path: no caller
+// query, path segment or header reaches the API or the cache key. Keep in sync
+// with gas_reads.go.
+const GAS_TIERS_PATH = "/api/v1/paymaster/gas-tiers";
+const GAS_FEE_PREFIX = "/api/v1/tx/gas-fee/";
+const GAS_READ_CHAINS = new Set<string>(["1", "56", "137", "42161"]);
+const MAX_GAS_READ_QUERY = 128;
+const NO_STORE: Record<string, string> = { "Cache-Control": "no-store" };
+
+/**
+ * The canonical upstream path + query of a gas read: `undefined` when the path
+ * is not a gas read, `null` when it is one but invalid. gas-tiers takes exactly
+ * one chain field (chainId, or its protobuf spelling chain_id); gas-fee takes
+ * the chain as its only path segment and no query at all.
+ */
+function gasReadTarget(url: URL): string | null | undefined {
+  if (url.pathname === GAS_TIERS_PATH) {
+    const raw = url.search.slice(1);
+    if (raw === "" || raw.length > MAX_GAS_READ_QUERY) return null;
+    const fields = [...new URLSearchParams(raw)];
+    if (fields.length !== 1) return null;
+    const [key, chain] = fields[0];
+    if ((key !== "chainId" && key !== "chain_id") || !GAS_READ_CHAINS.has(chain)) return null;
+    return `${GAS_TIERS_PATH}?chainId=${chain}`;
+  }
+  if (url.pathname.startsWith(GAS_FEE_PREFIX)) {
+    const chain = url.pathname.slice(GAS_FEE_PREFIX.length);
+    if (chain === "" || chain.includes("/")) return undefined;
+    if (url.search !== "" || !GAS_READ_CHAINS.has(chain)) return null;
+    return GAS_FEE_PREFIX + chain;
+  }
+  return undefined;
+}
+
+/**
+ * Seconds of shared-cache freshness left on an upstream response: s-maxage (or
+ * max-age) minus Age. 0 means it must not be stored or reused.
+ */
+function remainingFreshness(headers: Headers): number {
+  if ((headers.get("Vary") ?? "").split(",").some((value) => value.trim() === "*")) return 0;
+  const directives = (headers.get("Cache-Control") ?? "").toLowerCase().split(",").map((value) => value.trim());
+  if (directives.some((value) => ["no-store", "no-cache", "private"].includes(value.split("=")[0].trim()))) return 0;
+  const lifetime = (directives.find((value) => value.startsWith("s-maxage=")) ??
+    directives.find((value) => value.startsWith("max-age=")))?.split("=")[1];
+  const age = headers.get("Age") ?? "0";
+  if (!lifetime || !/^[0-9]+$/.test(lifetime) || !/^[0-9]+$/.test(age)) return 0;
+  const remaining = Number(lifetime) - Number(age);
+  return Number.isSafeInteger(remaining) && remaining > 0 ? remaining : 0;
+}
+
+/**
+ * Serve a validated gas read through the edge cache. A 200 is cached for what
+ * is left of the API's freshness (never extended); errors pass through with
+ * `no-store` and are never cached. Response headers are rebuilt: no cookies,
+ * Vary or tracing headers from the API reach the client or the cache.
+ */
+async function gasRead(target: string, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const cache = caches.default;
+  const cacheKey = new Request(url.origin + target, { method: "GET" });
+  const cached = await cache.match(cacheKey);
+  if (cached) return withCors(cached);
+  let upstream: Response;
+  try {
+    upstream = await fetch(env.TARGET + target, { headers: STRIP_IP_HEADERS, redirect: "manual" });
+  } catch {
+    return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
+  }
+  if (upstream.status < 200 || upstream.status >= 300 && upstream.status < 400) {
+    void upstream.body?.cancel().catch(() => {});
+    return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
+  }
+  const fresh = upstream.status === 200 ? remainingFreshness(upstream.headers) : 0;
+  const headers = new Headers({
+    "Cache-Control": fresh > 0 ? `public, max-age=${fresh}` : "no-store",
+    "X-Content-Type-Options": "nosniff",
+  });
+  const contentType = upstream.headers.get("Content-Type");
+  if (contentType) headers.set("Content-Type", contentType);
+  const response = new Response(upstream.body, { status: upstream.status, headers });
+  if (fresh > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return withCors(response);
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
@@ -85,6 +171,12 @@ export default {
       return withCors(new Response(null, { status: 204 }));
     }
     if (url.pathname === "/health") return withCors(new Response("ok"));
+
+    if (req.method === "GET") {
+      const target = gasReadTarget(url);
+      if (target === null) return withCors(new Response("invalid gas read", { status: 400, headers: NO_STORE }));
+      if (target !== undefined) return gasRead(target, url, env, ctx);
+    }
 
     // /ohttp-configs + the public reads are cacheable GETs. Serve them through
     // the edge cache, which honors the paymaster's Cache-Control (max-age /

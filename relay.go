@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 const (
@@ -77,6 +78,10 @@ func New(gatewayURL string, client *http.Client) http.Handler {
 		})
 	}
 
+	// Public gas reads (gas tiers, network base fee): strictly validated and
+	// canonicalized before forwarding; see gas_reads.go.
+	handleGasReads(mux, client, cache, gatewayURL)
+
 	gateway := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var (
 			body []byte
@@ -143,6 +148,7 @@ func proxyGet(client *http.Client, cache *ttlCache, url string, w http.ResponseW
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
 	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -152,6 +158,7 @@ func proxyGet(client *http.Client, cache *ttlCache, url string, w http.ResponseW
 	req.Header.Set("User-Agent", "")
 	resp, err := client.Do(req)
 	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -159,18 +166,34 @@ func proxyGet(client *http.Client, cache *ttlCache, url string, w http.ResponseW
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	ct := resp.Header.Get("Content-Type")
 	cc := resp.Header.Get("Cache-Control")
-	// Cache only 200s, and only for the TTL the paymaster grants (cacheTTL
-	// returns ok=false for no-store/no-cache/private or a missing max-age).
-	if resp.StatusCode == http.StatusOK {
+	age, ageOK := upstreamAge(resp.Header.Get("Age"))
+	switch {
+	case resp.StatusCode != http.StatusOK:
+		// Never cache an error, here or downstream (CDN, browser): the next
+		// request must reach the paymaster again.
+		cc = "no-store"
+	case !ageOK:
+		// RFC 9111 §5.1: an invalid Age means the response must be treated as stale.
+		cc = "no-store"
+	default:
+		// Cache only 200s, and only for what is LEFT of the TTL the paymaster
+		// grants (cacheTTL returns ok=false for no-store/no-cache/private or a
+		// missing max-age). An upstream Age counts against it, so a response that
+		// already sat in an upstream cache is never kept past its freshness.
 		if ttl, ok := cacheTTL(cc); ok {
+			if age >= ttl {
+				cc = "no-store"
+				break
+			}
 			now := timeNow()
 			cache.put(url, cacheEntry{
 				status:      resp.StatusCode,
 				body:        body,
 				contentType: ct,
 				cacheCtl:    cc,
+				upstreamAge: age,
 				storedAt:    now,
-				expiresAt:   now.Add(ttl),
+				expiresAt:   now.Add(ttl - age),
 			})
 		}
 	}
@@ -178,16 +201,20 @@ func proxyGet(client *http.Client, cache *ttlCache, url string, w http.ResponseW
 		w.Header().Set("Content-Type", ct)
 	}
 	// Preserve cacheability so a CDN in front of the relay can cache the
-	// (public) keyconfig / gas-quote / supported-tokens responses too.
+	// (public) keyconfig / gas-quote / supported-tokens responses too. Age is
+	// passed on with it, so a downstream cache cannot extend the freshness.
 	if cc != "" {
 		w.Header().Set("Cache-Control", cc)
+	}
+	if age > 0 && cc != "no-store" {
+		w.Header().Set("Age", strconv.Itoa(int(age/time.Second)))
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
 }
 
-// writeCached serves a cached entry, tagging it with an Age header (seconds
-// since it was stored) as an HTTP cache should.
+// writeCached serves a cached entry, tagging it with an Age header (the
+// upstream Age plus seconds since it was stored) as an HTTP cache should.
 func writeCached(w http.ResponseWriter, e cacheEntry) {
 	if e.contentType != "" {
 		w.Header().Set("Content-Type", e.contentType)
@@ -195,11 +222,11 @@ func writeCached(w http.ResponseWriter, e cacheEntry) {
 	if e.cacheCtl != "" {
 		w.Header().Set("Cache-Control", e.cacheCtl)
 	}
-	age := int(timeNow().Sub(e.storedAt).Seconds())
+	age := timeNow().Sub(e.storedAt)
 	if age < 0 {
 		age = 0
 	}
-	w.Header().Set("Age", strconv.Itoa(age))
+	w.Header().Set("Age", strconv.Itoa(int((e.upstreamAge+age)/time.Second)))
 	w.WriteHeader(e.status)
 	_, _ = w.Write(e.body)
 }

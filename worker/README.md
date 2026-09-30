@@ -45,6 +45,17 @@ encapsulated body and its `Content-Type`, never any client header it received.
   to the paymaster directly (a direct fetch would leak the client IP).
 - `POST /gateway` (`Content-Type: message/ohttp-req`) → the paymaster's
   `message/ohttp-res`, relayed back unchanged.
+- `GET /api/v1/paymaster/gas-quote` and `GET /api/v1/paymaster/supported-tokens`
+  → the paymaster's public quote and fee-token reads (path + query).
+- `GET /api/v1/paymaster/gas-tiers?chainId=<id>` and `GET /api/v1/tx/gas-fee/<id>`
+  → the gas tiers and network base fee. Fresh-only public reads: `<id>` must be
+  `1`, `56`, `137` or `42161`; `gas-tiers` accepts exactly one `chainId` (or
+  `chain_id`) and nothing else; `gas-fee` accepts no query. Invalid requests get
+  a `400 no-store` without reaching the API. Only the canonical target is
+  forwarded and used as the edge-cache key; a `200` is cached for what is left
+  of the API's `s-maxage`/`max-age` after `Age`, errors are relayed `no-store`
+  and never cached, redirects become `502`, and cookies/`Vary`/tracing headers
+  are dropped. See the [root README](../README.md#endpoints).
 
 All responses include permissive CORS headers, and `OPTIONS` preflights are
 accepted, so public browser clients can call the keyless relay directly. The
@@ -59,6 +70,17 @@ relay does not use cookies or browser credentials.
 Set `TARGET` in [`wrangler.toml`](wrangler.toml) under `[vars]`, or override it
 per-environment with `npx wrangler secret put TARGET` / the Cloudflare dashboard.
 
+## Test
+
+From the repository root (Node 22+, no Wrangler, network or credentials):
+
+```bash
+node --experimental-strip-types --test worker/test/*.test.mjs
+```
+
+The tests stub `fetch` and `caches.default`; they do not verify Cloudflare-added
+headers or the deployed route.
+
 ## Deploy
 
 From the repository root:
@@ -67,7 +89,7 @@ From the repository root:
 make deploy
 ```
 
-This runs the relay tests, checks the Worker bundle, deploys it, and verifies
+This runs the Go and Worker tests, checks the Worker bundle, deploys it, and verifies
 the live browser CORS preflight. If Wrangler needs authentication, first run
 `make cloudflare-login`.
 

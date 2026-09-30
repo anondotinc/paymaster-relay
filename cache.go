@@ -14,12 +14,16 @@ var timeNow = time.Now
 // tiny key space (path × chainId × priority), so this is only a runaway guard.
 const maxCacheEntries = 1024
 
+// maxCacheAge caps a parsed Age so it cannot overflow a time.Duration.
+const maxCacheAge = 365 * 24 * time.Hour
+
 // cacheEntry is a stored upstream GET response plus its freshness window.
 type cacheEntry struct {
 	status      int
 	body        []byte
 	contentType string
 	cacheCtl    string
+	upstreamAge time.Duration // the paymaster response's Age when stored
 	storedAt    time.Time
 	expiresAt   time.Time
 }
@@ -100,4 +104,21 @@ func cacheTTL(cacheControl string) (time.Duration, bool) {
 		return time.Duration(lifetime) * time.Second, true
 	}
 	return 0, false
+}
+
+// upstreamAge parses an upstream Age header (RFC 9111 §5.1). An absent header
+// is age zero; a present but invalid one returns ok=false, and the response
+// must then be treated as stale.
+func upstreamAge(value string) (time.Duration, bool) {
+	if value == "" {
+		return 0, true
+	}
+	if strings.TrimLeft(value, "0123456789") != "" {
+		return 0, false // not a plain non-negative integer ("+5", "-1", "5, 6")
+	}
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || seconds > int64(maxCacheAge/time.Second) {
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
 }
