@@ -5,8 +5,8 @@ import (
 	"net/url"
 )
 
-// Public gas reads: the paymaster's gas tiers and the API's network base fee.
-// Both are identity-free and fresh-only (the API answers
+// Public gas reads: the paymaster's gas tiers and gas history and the API's
+// network base fee. All are identity-free and fresh-only (the API answers
 // "public, s-maxage=5, max-age=5"), so the SDK reads them through the relay
 // instead of calling the API directly. Unlike the verbatim publicReadPaths,
 // the relay forwards ONLY a validated, canonical chainId on a fixed path: no
@@ -14,7 +14,10 @@ import (
 // Keep in sync with GAS_READ_CHAINS / gasReadTarget in worker/src/index.ts.
 const (
 	gasTiersPath = "/api/v1/paymaster/gas-tiers"
-	gasFeePrefix = "/api/v1/tx/gas-fee/"
+	// gasHistoryPath is the paymaster's recent gas history (the apps' live gas
+	// chart): the same one-chainId read as gas-tiers.
+	gasHistoryPath = "/api/v1/paymaster/gas-history"
+	gasFeePrefix   = "/api/v1/tx/gas-fee/"
 	// maxGasReadQuery bounds the raw query before parsing ("chainId=42161" is 13).
 	maxGasReadQuery = 128
 )
@@ -72,14 +75,17 @@ func rejectGasRead(w http.ResponseWriter) {
 // canonical target through proxyGet, which honours (never extends) the API's
 // Cache-Control and never caches an error.
 func handleGasReads(mux *http.ServeMux, client *http.Client, cache *ttlCache, gatewayURL string) {
-	mux.HandleFunc("GET "+gasTiersPath, func(w http.ResponseWriter, r *http.Request) {
-		var query, ok = canonicalGasTiersQuery(r.URL.RawQuery)
-		if !ok {
-			rejectGasRead(w)
-			return
-		}
-		proxyGet(client, cache, gatewayURL+gasTiersPath+"?"+query, w, r)
-	})
+	for _, path := range []string{gasTiersPath, gasHistoryPath} {
+		var path = path
+		mux.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
+			var query, ok = canonicalGasTiersQuery(r.URL.RawQuery)
+			if !ok {
+				rejectGasRead(w)
+				return
+			}
+			proxyGet(client, cache, gatewayURL+path+"?"+query, w, r)
+		})
+	}
 	mux.HandleFunc("GET "+gasFeePrefix+"{chainId}", func(w http.ResponseWriter, r *http.Request) {
 		var chain, ok = gasFeeChain(r)
 		if !ok {

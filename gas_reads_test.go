@@ -47,6 +47,8 @@ func TestGasReadsProxied(t *testing.T) {
 	var cases = []struct{ path, target, body string }{
 		{"/api/v1/paymaster/gas-tiers?chainId=42161", "https://api.test/api/v1/paymaster/gas-tiers?chainId=42161", `{"chainId":"42161","tiers":[]}`},
 		{"/api/v1/paymaster/gas-tiers?chain_id=1", "https://api.test/api/v1/paymaster/gas-tiers?chainId=1", `{"chainId":"1","tiers":[]}`},
+		{"/api/v1/paymaster/gas-history?chainId=137", "https://api.test/api/v1/paymaster/gas-history?chainId=137", `{"chainId":"137","points":[],"windowSeconds":1800}`},
+		{"/api/v1/paymaster/gas-history?chain_id=1", "https://api.test/api/v1/paymaster/gas-history?chainId=1", `{"chainId":"1","windowSeconds":1800}`},
 		{"/api/v1/tx/gas-fee/42161", "https://api.test/api/v1/tx/gas-fee/42161", `{"chainId":"42161","pendingBaseFee":"0.02"}`},
 		{"/api/v1/tx/gas-fee/56", "https://api.test/api/v1/tx/gas-fee/56", `{"chainId":"56","pendingBaseFee":"0.1"}`},
 	}
@@ -110,6 +112,12 @@ func TestGasReadsRejectInvalid(t *testing.T) {
 		{http.MethodGet, "/api/v1/paymaster/gas-tiers?chainId=1&url=https://attacker.test", 400},
 		{http.MethodGet, "/api/v1/paymaster/gas-tiers?chainId=1%zz", 400},
 		{http.MethodGet, "/api/v1/paymaster/gas-tiers?chainId=1" + strings.Repeat("&", 128), 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-history", 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-history?chainId=999", 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-history?chainId=01", 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-history?chainId=1&chainId=1", 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-history?chainId=1&window=86400", 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-history?chainId=1&account=secret", 400},
 		{http.MethodGet, "/api/v1/tx/gas-fee/999", 400},
 		{http.MethodGet, "/api/v1/tx/gas-fee/01", 400},
 		{http.MethodGet, "/api/v1/tx/gas-fee/-1", 400},
