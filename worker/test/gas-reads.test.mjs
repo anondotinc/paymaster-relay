@@ -47,6 +47,7 @@ test("forwards only the canonical chain to the fixed API and rebuilds response h
   for (const [path, target] of [
     ["/api/v1/paymaster/gas-tiers?chainId=42161", "https://api.invalid/api/v1/paymaster/gas-tiers?chainId=42161"],
     ["/api/v1/paymaster/gas-tiers?chain_id=1", "https://api.invalid/api/v1/paymaster/gas-tiers?chainId=1"],
+    ["/api/v1/paymaster/gas-history?chainId=56", "https://api.invalid/api/v1/paymaster/gas-history?chainId=56"],
     ["/api/v1/tx/gas-fee/42161", "https://api.invalid/api/v1/tx/gas-fee/42161"],
     ["/api/v1/tx/gas-fee/137", "https://api.invalid/api/v1/tx/gas-fee/137"],
   ]) {
@@ -65,6 +66,7 @@ test("forwards only the canonical chain to the fixed API and rebuilds response h
   }
   // Cache keys are canonical: the caller's spelling never reaches them.
   assert.deepEqual([...stored.keys()].sort(), [
+    "https://relay.invalid/api/v1/paymaster/gas-history?chainId=56",
     "https://relay.invalid/api/v1/paymaster/gas-tiers?chainId=1",
     "https://relay.invalid/api/v1/paymaster/gas-tiers?chainId=42161",
     "https://relay.invalid/api/v1/tx/gas-fee/137",
@@ -74,20 +76,22 @@ test("forwards only the canonical chain to the fixed API and rebuilds response h
 
 test("rejects missing, repeated, unknown or unsupported fields and odd paths without an API call", async () => {
   for (const query of ["", "chainId=999", "chainId=01", "chainId=-1", "chainId=1.0", "chainId=+1", "chainId=", "chainId=1&chainId=1", "chainId=1&chain_id=1", "chainId=&chain_id=1", "chainId=1&priority=fast", "chainId=1&account=secret", "chainId=1;account=secret", "chainId=1&url=https://attacker.invalid", "chainId=1%zz", "chainId=1" + "&".repeat(128)]) {
-    const response = await send(req("/api/v1/paymaster/gas-tiers?" + query));
-    assert.equal(response.status, 400, query);
-    assert.equal(response.headers.get("Cache-Control"), "no-store");
-    assert.equal(response.headers.get("Access-Control-Allow-Origin"), "*");
+    for (const path of ["/api/v1/paymaster/gas-tiers?", "/api/v1/paymaster/gas-history?"]) {
+      const response = await send(req(path + query));
+      assert.equal(response.status, 400, path + query);
+      assert.equal(response.headers.get("Cache-Control"), "no-store");
+      assert.equal(response.headers.get("Access-Control-Allow-Origin"), "*");
+    }
   }
   for (const path of ["/999", "/01", "/-1", "/secret", "/%34%32161", "/42161%2Fextra", "/42161?blockCount=5", "/42161?chainId=1"]) {
     const response = await send(req("/api/v1/tx/gas-fee" + path));
     assert.equal(response.status, 400, path);
     assert.equal(response.headers.get("Cache-Control"), "no-store");
   }
-  for (const path of ["/api/v1/tx/gas-fee/", "/api/v1/tx/gas-fee/42161/", "/api/v1/tx/gas-fee/42161/extra", "/api/v1/tx/gas-fee", "/api/v1/tx/gas-fees/42161", "/api/v1/paymaster/gas-tiers/1"]) {
+  for (const path of ["/api/v1/tx/gas-fee/", "/api/v1/tx/gas-fee/42161/", "/api/v1/tx/gas-fee/42161/extra", "/api/v1/tx/gas-fee", "/api/v1/tx/gas-fees/42161", "/api/v1/paymaster/gas-tiers/1", "/api/v1/paymaster/gas-history/1"]) {
     assert.equal((await send(req(path))).status, 404, path);
   }
-  for (const path of ["/api/v1/paymaster/gas-tiers?chainId=1", "/api/v1/tx/gas-fee/1"]) {
+  for (const path of ["/api/v1/paymaster/gas-tiers?chainId=1", "/api/v1/paymaster/gas-history?chainId=1", "/api/v1/tx/gas-fee/1"]) {
     assert.equal((await send(req(path, { method: "POST", body: "x" }))).status, 404, path);
   }
   assert.equal(calls.length, 0);

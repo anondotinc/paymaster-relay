@@ -86,13 +86,17 @@ const PUBLIC_READ_PATHS = new Set<string>([
   "/api/v1/paymaster/supported-tokens",
 ]);
 
-// Public gas reads: the paymaster's gas tiers and the API's network base fee.
-// Both are identity-free and fresh-only (the API answers
+// Public gas reads: the paymaster's gas tiers and gas history and the API's
+// network base fee. All are identity-free and fresh-only (the API answers
 // "public, s-maxage=5, max-age=5"). Unlike the verbatim reads above, the relay
 // forwards ONLY a validated, canonical chainId on a fixed path: no caller
 // query, path segment or header reaches the API or the cache key. Keep in sync
 // with gas_reads.go.
 const GAS_TIERS_PATH = "/api/v1/paymaster/gas-tiers";
+// The paymaster's recent gas history (the apps' live gas chart). Same shape
+// of read as gas-tiers: one canonical chainId, identity-free, fresh-only.
+const GAS_HISTORY_PATH = "/api/v1/paymaster/gas-history";
+const CHAIN_QUERY_PATHS = new Set<string>([GAS_TIERS_PATH, GAS_HISTORY_PATH]);
 const GAS_FEE_PREFIX = "/api/v1/tx/gas-fee/";
 const GAS_READ_CHAINS = new Set<string>(["1", "56", "137", "42161"]);
 const MAX_GAS_READ_QUERY = 128;
@@ -100,19 +104,20 @@ const NO_STORE: Record<string, string> = { "Cache-Control": "no-store" };
 
 /**
  * The canonical upstream path + query of a gas read: `undefined` when the path
- * is not a gas read, `null` when it is one but invalid. gas-tiers takes exactly
- * one chain field (chainId, or its protobuf spelling chain_id); gas-fee takes
- * the chain as its only path segment and no query at all.
+ * is not a gas read, `null` when it is one but invalid. gas-tiers and
+ * gas-history take exactly one chain field (chainId, or its protobuf spelling
+ * chain_id); gas-fee takes the chain as its only path segment and no query at
+ * all.
  */
 function gasReadTarget(url: URL): string | null | undefined {
-  if (url.pathname === GAS_TIERS_PATH) {
+  if (CHAIN_QUERY_PATHS.has(url.pathname)) {
     const raw = url.search.slice(1);
     if (raw === "" || raw.length > MAX_GAS_READ_QUERY) return null;
     const fields = [...new URLSearchParams(raw)];
     if (fields.length !== 1) return null;
     const [key, chain] = fields[0];
     if ((key !== "chainId" && key !== "chain_id") || !GAS_READ_CHAINS.has(chain)) return null;
-    return `${GAS_TIERS_PATH}?chainId=${chain}`;
+    return `${url.pathname}?chainId=${chain}`;
   }
   if (url.pathname.startsWith(GAS_FEE_PREFIX)) {
     const chain = url.pathname.slice(GAS_FEE_PREFIX.length);
