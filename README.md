@@ -61,6 +61,13 @@ access to paymaster secrets.
   change both together.
   They are not behind the per-source sealed-route limits (identity-free, cached
   for seconds) and keep their own fresh-only cache path.
+- `GET /ppoi/ohttp-configs` and `POST /ppoi/gateway` are available **only when
+  `PPOI_TARGET` is set** (404 otherwise). They forward to
+  `${PPOI_TARGET}/ohttp-configs` and `${PPOI_TARGET}/gateway` (production:
+  `https://proxy.anon.inc/ohttp`) with the same keyless, no-log, 1 MiB handling
+  as the paymaster's sealed route, and cacheable key configs. The target must
+  not share a base with the paymaster or scheduler; the PPOI gateway holds its
+  own keys, so clients pin a separate PPOI signing key.
 - `GET /scheduler/ohttp-configs` and `POST /scheduler/gateway` are available
   **only when a separate scheduler target is configured**. They append
   `/ohttp-configs` and `/gateway` to that target; they never fall back to the
@@ -79,7 +86,11 @@ requests identity encoding. It accepts only HTTP 200 with the expected MIME
 type and rejects truncated, oversized, or unexpectedly compressed responses.
 Gateway requests are limited to 1 MiB for paymaster and 4 MiB for scheduler;
 all responses remain limited to 1 MiB. GET and POST upstream work shares the
-bounded concurrency/source-rate safeguards and a 20-second deadline. Gateway
+bounded concurrency and per-route source-rate buckets (paymaster 60/min,
+scheduler 60/min, PPOI 180/min per hashed source, each independent). Sealed
+routes have a 40-second deadline (above the backend gateway ladder: handler
+25 s < forwarder 28 s < gateway 30-35 s < relay 40 s); public reads and key
+configs keep 20 seconds. Gateway
 responses and errors are `no-store`; no plaintext diagnostic body is forwarded.
 
 ## Caching
@@ -123,6 +134,7 @@ cookies or browser credentials.
 | Env | Meaning |
 |---|---|
 | `OHTTP_GATEWAY_URL` | **required** — base URL of the paymaster's OHTTP gateway (e.g. `https://paymaster.internal`) |
+| `PPOI_TARGET` | Optional — distinct PPOI gateway base, e.g. `https://proxy.anon.inc/ohttp`. Unset disables `/ppoi/*` (404). |
 | `OHTTP_SCHEDULER_GATEWAY_URL` | Optional — distinct scheduler gateway base, e.g. `http://backend:8080/scheduler`. Unset disables scheduler routes. |
 | `RELAY_LISTEN` | bind address (default `:8080`) |
 

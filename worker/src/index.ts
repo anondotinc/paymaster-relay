@@ -2,6 +2,12 @@ export interface Env {
   TARGET: string;
   /** Optional dedicated scheduler gateway. Never inferred from TARGET. */
   SCHEDULER_TARGET?: string;
+  /**
+   * Optional PPOI gateway base (`/ppoi/*` routes), e.g. https://proxy.anon.inc/ohttp.
+   * Unset disables the routes (404). Never inferred; must not share a base with
+   * TARGET or SCHEDULER_TARGET.
+   */
+  PPOI_TARGET?: string;
 }
 
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
@@ -27,7 +33,13 @@ const MAX_CONCURRENCY = 128;
 // Leave headroom for the runtime/cache and stream-copy overhead within an
 // isolate. A request-count cap alone is unsafe for 4 MiB scheduler uploads.
 const MAX_BUFFERED_WORK = 32 << 20;
-const MAX_SOURCE_REQUESTS_PER_MINUTE = 60;
+// Per-route, per-source rate-limit buckets: PPOI sync (3 concurrent
+// 50-commitment batches) must not starve paymaster status polling, and vice versa.
+const BUCKET_LIMITS = { paymaster: 60, scheduler: 60, ppoi: 180 } as const;
+type Bucket = keyof typeof BUCKET_LIMITS;
+// Sealed routes nest above the backend gateway ladder (handler 25 s < forwarder
+// 28 s < gateway 30-35 s < relay 40 s); public reads and key configs keep 20 s.
+const SEALED_TIMEOUT_MS = 40_000;
 const TIMEOUT_MS = 20_000;
 const CONFIG_TYPE = "application/ohttp-keys-signed";
 const REQUEST_TYPE = "message/ohttp-req";
@@ -267,7 +279,7 @@ export function createRelayHandler(options: RelayOptions = {}) {
   let activeRequests = 0;
   let reservedBytes = 0;
 
-  async function sourceAllowed(req: Request): Promise<boolean> {
+  async function sourceAllowed(req: Request, bucket: Bucket): Promise<boolean> {
     const salt = isolateSalt();
     const now = Date.now();
     if (sourceWindows.size >= 10_000) {
@@ -276,7 +288,7 @@ export function createRelayHandler(options: RelayOptions = {}) {
       }
       if (sourceWindows.size >= 10_000) sourceWindows.delete(sourceWindows.keys().next().value as string);
     }
-    const source = new TextEncoder().encode(req.headers.get("CF-Connecting-IP") ?? "unknown");
+    const source = new TextEncoder().encode(bucket + "\0" + (req.headers.get("CF-Connecting-IP") ?? "unknown"));
     const material = new Uint8Array(salt.length + source.length);
     material.set(salt);
     material.set(source, salt.length);
@@ -287,7 +299,7 @@ export function createRelayHandler(options: RelayOptions = {}) {
       sourceWindows.set(key, { started: now, count: 1 });
       return true;
     }
-    if (window.count >= MAX_SOURCE_REQUESTS_PER_MINUTE) return false;
+    if (window.count >= BUCKET_LIMITS[bucket]) return false;
     window.count += 1;
     return true;
   }
@@ -342,10 +354,13 @@ export function createRelayHandler(options: RelayOptions = {}) {
         return gasRead(gasTarget, url, env, ctx);
       }
       const scheduler = path === "/scheduler/ohttp-configs" || path === "/scheduler/gateway";
-      const keyConfig = path === "/ohttp-configs" || path === "/scheduler/ohttp-configs";
-      const gateway = path === "/gateway" || path === "/scheduler/gateway";
+      const ppoi = path === "/ppoi/ohttp-configs" || path === "/ppoi/gateway";
+      const keyConfig = path === "/ohttp-configs" || path === "/scheduler/ohttp-configs" || path === "/ppoi/ohttp-configs";
+      const gateway = path === "/gateway" || path === "/scheduler/gateway" || path === "/ppoi/gateway";
       const publicRead = path === QUOTE_PATH || path === TOKENS_PATH;
       if (!keyConfig && !gateway && !publicRead && path !== "/health") return fail(404, "not found");
+      // PPOI is opt-in: with no PPOI_TARGET the routes do not exist.
+      if (ppoi && !env.PPOI_TARGET) return fail(404, "not found");
       let query: string;
       try { query = canonicalQuery(path, url); } catch (error) {
         return fail(error instanceof RelayFailure ? error.status : 400, "invalid query");
@@ -358,8 +373,11 @@ export function createRelayHandler(options: RelayOptions = {}) {
       if (requestEncoding && requestEncoding !== "identity") return fail(415, "unsupported content encoding");
       const paymasterBase = targetBase(env.TARGET);
       const schedulerBase = targetBase(env.SCHEDULER_TARGET);
-      const base = scheduler ? schedulerBase : paymasterBase;
-      if (!base || (scheduler && base === paymasterBase)) return fail(503, "gateway unavailable");
+      const ppoiBase = ppoi ? targetBase(env.PPOI_TARGET) : undefined;
+      const base = ppoi ? ppoiBase : scheduler ? schedulerBase : paymasterBase;
+      const bucket: Bucket = ppoi ? "ppoi" : scheduler ? "scheduler" : "paymaster";
+      if (!base || (scheduler && base === paymasterBase) ||
+          (ppoi && (base === paymasterBase || base === targetBase(env.SCHEDULER_TARGET)))) return fail(503, "gateway unavailable");
       const requestLimit = scheduler ? MAX_SCHEDULER_REQUEST : MAX_BODY;
       const reservation = (gateway ? 2 * requestLimit : 0) + 3 * MAX_BODY;
       if (activeRequests >= (options.maxConcurrency ?? MAX_CONCURRENCY) ||
@@ -372,18 +390,18 @@ export function createRelayHandler(options: RelayOptions = {}) {
       const abort = () => controller.abort(req.signal.reason);
       req.signal.addEventListener("abort", abort, { once: true });
       if (req.signal.aborted) abort();
-      const timer = setTimeout(() => controller.abort(new Error("relay timeout")), options.timeoutMs ?? TIMEOUT_MS);
+      const timer = setTimeout(() => controller.abort(new Error("relay timeout")), options.timeoutMs ?? (gateway ? SEALED_TIMEOUT_MS : TIMEOUT_MS));
       const signal = controller.signal;
       try {
-        if (!(await abortable(sourceAllowed(req), signal))) {
+        if (!(await abortable(sourceAllowed(req, bucket), signal))) {
           return reply("rate limited", 429, { "Retry-After": "60" });
         }
-        const upstreamPath = scheduler ? path.slice("/scheduler".length) : path;
+        const upstreamPath = scheduler ? path.slice("/scheduler".length) : ppoi ? path.slice("/ppoi".length) : path;
         const upstreamURL = base + upstreamPath + query;
         // Version + purpose + target isolate caches from old relay behavior and
         // configuration changes. No unvalidated caller query reaches cache keys.
         const cacheURL = new URL(req.url);
-        cacheURL.pathname = "/.relay-public-v2/" + (scheduler ? "scheduler/" : "paymaster/") + encodeURIComponent(upstreamURL);
+        cacheURL.pathname = "/.relay-public-v2/" + (ppoi ? "ppoi/" : scheduler ? "scheduler/" : "paymaster/") + encodeURIComponent(upstreamURL);
         cacheURL.search = "";
         const cacheKey = new Request(cacheURL.toString(), { method: "GET" });
         const cache = options.cache === undefined

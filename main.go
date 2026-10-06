@@ -17,21 +17,22 @@ func main() {
 		listen       = envOr("RELAY_LISTEN", ":8080")
 		gatewayURL   = os.Getenv("OHTTP_GATEWAY_URL")
 		schedulerURL = os.Getenv("OHTTP_SCHEDULER_GATEWAY_URL")
+		ppoiURL      = os.Getenv("PPOI_TARGET")
 		handler      http.Handler
 		err          error
 	)
 	if gatewayURL == "" {
 		log.Fatal("OHTTP_GATEWAY_URL is required")
 	}
-	handler, err = NewWithScheduler(gatewayURL, schedulerURL, &http.Client{Timeout: 20 * time.Second})
+	handler, err = NewWithTargets(gatewayURL, schedulerURL, ppoiURL, &http.Client{Timeout: sealedTimeout})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("anon-ohttp-relay listening on %s (scheduler enabled: %t)", listen, schedulerURL != "")
+	log.Printf("anon-ohttp-relay listening on %s (scheduler enabled: %t, ppoi enabled: %t)", listen, schedulerURL != "", ppoiURL != "")
 	// Explicit timeouts: this relay is public and keyless, so it must not let a
 	// slow/idle client tie up a connection indefinitely (Slowloris). WriteTimeout
-	// comfortably exceeds the 20s upstream client timeout so a legitimately slow
+	// comfortably exceeds the 40s sealed upstream client timeout so a legitimately slow
 	// gateway response still makes it back.
 	var srv = &http.Server{
 		Addr:              listen,

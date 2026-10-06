@@ -7,6 +7,10 @@ routes = [
 
 [vars]
 TARGET = "https://api.anon.inc"
+# PPOI lookups over OHTTP: /ppoi/ohttp-configs and /ppoi/gateway forward to
+# ${PPOI_TARGET}/ohttp-configs and /gateway. Must differ from TARGET (the
+# paymaster) and SCHEDULER_TARGET; the proxy gateway holds its own PPOI keys.
+PPOI_TARGET = "https://proxy.anon.inc/ohttp"
 # SCHEDULER_TARGET is deliberately unset: scheduler relay activation requires a
 # dedicated backend OHTTP gateway and independently verified scheduler key pin.
 # Do not point it at TARGET (whose /gateway routes to the paymaster).

@@ -53,6 +53,11 @@ verification.
   key. Fetching a key from a custom relay does not make the relay trustworthy.
 - `POST /gateway` (`Content-Type: message/ohttp-req`) → the paymaster's
   `message/ohttp-res`, relayed back unchanged.
+- `GET /ppoi/ohttp-configs` and `POST /ppoi/gateway` → the PPOI OHTTP gateway's
+  `/ohttp-configs` and `/gateway` under `PPOI_TARGET`. Unset: `404`. Set but
+  invalid, or sharing a base with `TARGET`/`SCHEDULER_TARGET`: `503`, never a
+  paymaster response. Same keyless handling and 1 MiB limits as the paymaster
+  route; PPOI clients use their own signing-key pin.
 - `GET /scheduler/ohttp-configs` and `POST /scheduler/gateway` → the **separate**
   scheduler gateway's `/ohttp-configs` and `/gateway` under `SCHEDULER_TARGET`.
   Without a distinct, valid scheduler target these return `503`, never a
@@ -91,9 +96,15 @@ relay does not use cookies or browser credentials.
 - Concurrency is reserved before reading uploads (128 requests per isolate).
   An additional conservative 32 MiB buffered-work reservation limits large
   uploads sooner; this leaves headroom within the [Worker memory limit](https://developers.cloudflare.com/workers/platform/limits/#memory).
-  Accepted requests have a 20-second deadline and follow caller cancellation.
-  A process-local, salted per-source bucket permits 60 requests per minute;
-  this is load protection, not a global rate-limit guarantee.
+  Accepted sealed requests have a 40-second deadline (above the backend gateway
+  ladder: handler 25 s < forwarder 28 s < gateway 30-35 s < relay 40 s); key
+  configs and public reads keep 20 seconds. Both follow caller cancellation.
+  Each sealed request reserves 5 MiB of the 32 MiB budget (about 6 concurrent
+  sealed requests per isolate); POI sync runs 3 concurrent requests, so it fits
+  but shares that budget with paymaster traffic.
+  Process-local, salted per-source buckets are kept per route: paymaster 60,
+  scheduler 60 and PPOI 180 requests per minute, so PPOI sync cannot starve
+  paymaster polling; this is load protection, not a global rate-limit guarantee.
 - Sealed responses and errors are `no-store`. Only validated public reads and
   signed configs can enter the edge cache, respecting the gateway's freshness
   directives and Age. Cache keys include target, service, and format version.
@@ -107,6 +118,7 @@ relay does not use cookies or browser credentials.
 | Var | Meaning |
 |---|---|
 | `TARGET` | base URL of the paymaster's OHTTP gateway (e.g. `https://paymaster.internal`) |
+| `PPOI_TARGET` | optional base URL of the PPOI OHTTP gateway; `https://proxy.anon.inc/ohttp` in `wrangler.toml`. Unset disables `/ppoi/*` |
 | `SCHEDULER_TARGET` | optional, distinct base URL of the backend's scheduler OHTTP gateway; **unset by default** |
 
 Set `TARGET` in [`wrangler.toml`](wrangler.toml) under `[vars]`, or override it
