@@ -82,8 +82,12 @@ func (s *relaySafeguards) allow(remoteAddr string, now time.Time) bool {
 }
 
 func (s *relaySafeguards) gateway(next http.Handler) http.Handler {
+	return s.gatewayWithLimit(maxBody, next)
+}
+
+func (s *relaySafeguards) gatewayWithLimit(requestLimit int64, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ContentLength > maxBody {
+		if r.ContentLength > requestLimit {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -99,7 +103,7 @@ func (s *relaySafeguards) gateway(next http.Handler) http.Handler {
 			http.Error(w, "relay busy", http.StatusServiceUnavailable)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), gatewayRequestTimeout)
+		var ctx, cancel = context.WithTimeout(r.Context(), gatewayRequestTimeout)
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

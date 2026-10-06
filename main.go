@@ -9,29 +9,33 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 )
 
 func main() {
 	var (
-		listen     = envOr("RELAY_LISTEN", ":8080")
-		gatewayURL = os.Getenv("OHTTP_GATEWAY_URL")
-		err        error
+		listen       = envOr("RELAY_LISTEN", ":8080")
+		gatewayURL   = os.Getenv("OHTTP_GATEWAY_URL")
+		schedulerURL = os.Getenv("OHTTP_SCHEDULER_GATEWAY_URL")
+		handler      http.Handler
+		err          error
 	)
 	if gatewayURL == "" {
 		log.Fatal("OHTTP_GATEWAY_URL is required")
 	}
-	gatewayURL = strings.TrimRight(gatewayURL, "/")
+	handler, err = NewWithScheduler(gatewayURL, schedulerURL, &http.Client{Timeout: 20 * time.Second})
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	log.Printf("anon-ohttp-relay listening on %s → %s", listen, gatewayURL)
+	log.Printf("anon-ohttp-relay listening on %s (scheduler enabled: %t)", listen, schedulerURL != "")
 	// Explicit timeouts: this relay is public and keyless, so it must not let a
 	// slow/idle client tie up a connection indefinitely (Slowloris). WriteTimeout
-	// comfortably exceeds the 30s upstream client timeout so a legitimately slow
+	// comfortably exceeds the 20s upstream client timeout so a legitimately slow
 	// gateway response still makes it back.
-	srv := &http.Server{
+	var srv = &http.Server{
 		Addr:              listen,
-		Handler:           New(gatewayURL, &http.Client{Timeout: 30 * time.Second}),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,

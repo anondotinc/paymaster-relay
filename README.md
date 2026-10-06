@@ -1,4 +1,4 @@
-# Anon Paymaster Relay
+# Anon OHTTP Relay
 
 A **keyless** Oblivious HTTP (RFC 9458) relay for the Anon paymaster. It sits in
 front of the paymaster (which holds the HPKE key and terminates OHTTP) and
@@ -12,7 +12,7 @@ Client ──HPKE-seal(to paymaster key)──▶  Relay (this)  ──▶  Paym
 ```
 
 This relay holds **no paymaster keys** and sees **no request plaintext**. The Go
-implementation forwards only the encapsulated body and its `Content-Type`,
+implementation forwards the encapsulated body and minimal server-owned protocol headers,
 never client headers or other PII. The Cloudflare Worker has an additional
 client-IP caveat described below. Either implementation can be operated without
 access to paymaster secrets.
@@ -32,23 +32,26 @@ access to paymaster secrets.
 - `POST /gateway` (`Content-Type: message/ohttp-req`) → the paymaster's
   `message/ohttp-res`, relayed back unchanged.
 - `GET /api/v1/paymaster/gas-quote` and `GET /api/v1/paymaster/supported-tokens`
-  → proxied (path + query) from the paymaster. These are **public, identity-free,
+  → proxied with validated, canonical queries from the paymaster. These are **public, identity-free,
   cacheable** reads — proxying them through the relay lets the client fetch its fee
   quote without exposing its IP to the paymaster, so the *whole* flow (quote →
   execute → status) goes through the relay. The relay caches them itself, honoring
-  the paymaster's TTL (see **Caching**); `Cache-Control` is preserved so a CDN can
+  the paymaster's remaining TTL (see **Caching**); safe cache metadata lets a CDN
   front them too. (No sealing — they carry no secrets.)
 
-  The set lives in `publicReadPaths` (`relay.go`) / `PUBLIC_READ_PATHS`
-  (`worker/src/index.ts`). The allowlist is explicit on purpose: the relay is
-  never an open proxy, and the JWT-scoped `GET /status/{job_id}` is deliberately
-  not exposed (its oblivious counterpart is the sealed `POST /gateway` path).
-- `GET /api/v1/paymaster/gas-tiers?chainId=<id>` and `GET /api/v1/tx/gas-fee/<id>`
-  → the paymaster's gas tiers and the API's network base fee. Both are public,
+  These two are the paymaster service's only public GET reads. The set lives in
+  `publicReadPaths` (`relay.go`) / the Worker route policy. A new read requires
+  reviewing both its path and allowed query fields/values. The allowlist is
+  explicit on purpose: the relay is never an open proxy, and the JWT-scoped
+  `GET /status/{job_id}` is deliberately not exposed (its oblivious counterpart is
+  the sealed `POST /gateway` path).
+- `GET /api/v1/paymaster/gas-tiers?chainId=<id>`, `GET /api/v1/paymaster/gas-history?chainId=<id>`
+  and `GET /api/v1/tx/gas-fee/<id>` → the paymaster's gas tiers and history and
+  the API's network base fee. Both are public,
   identity-free and **fresh-only** (the API answers
   `Cache-Control: public, s-maxage=5, max-age=5`). They are strictly validated
   before anything is forwarded: `<id>` must be exactly `1`, `56`, `137` or
-  `42161`; `gas-tiers` takes exactly one `chainId` (or its protobuf spelling
+  `42161`; `gas-tiers` and `gas-history` take exactly one `chainId` (or its protobuf spelling
   `chain_id`) and no other field; `gas-fee` takes no query and one path segment.
   Anything else is a `400` (`404` for other paths), never cached. The relay
   forwards only the canonical target (`?chainId=<id>` / `/<id>`), so no caller
@@ -56,10 +59,32 @@ access to paymaster secrets.
   paymaster doesn't serve, `503` with no base fee) pass through as `no-store`.
   The rules live in `gas_reads.go` / `gasReadTarget` (`worker/src/index.ts`);
   change both together.
+  They are not behind the per-source sealed-route limits (identity-free, cached
+  for seconds) and keep their own fresh-only cache path.
+- `GET /scheduler/ohttp-configs` and `POST /scheduler/gateway` are available
+  **only when a separate scheduler target is configured**. They append
+  `/ohttp-configs` and `/gateway` to that target; they never fall back to the
+  paymaster. The relay holds neither service's keys. Clients must independently
+  pin the scheduler signing key, not reuse the paymaster pin.
+
+Only exact paths and declared methods are accepted, including preflights.
+Public reads require `chainId` (or the protobuf alias `chain_id`) equal to
+`1`, `56`, `137`, or `42161`. Gas quotes also accept optional `priority`:
+`slow`, `normal`, or `fast` (case-insensitive; empty means the default).
+Duplicates, both chain spellings together, other fields, and query parameters
+on gateway/config/health paths are rejected before forwarding.
+
+The Go relay reconstructs headers, disables cookie jars and redirects, and
+requests identity encoding. It accepts only HTTP 200 with the expected MIME
+type and rejects truncated, oversized, or unexpectedly compressed responses.
+Gateway requests are limited to 1 MiB for paymaster and 4 MiB for scheduler;
+all responses remain limited to 1 MiB. GET and POST upstream work shares the
+bounded concurrency/source-rate safeguards and a 20-second deadline. Gateway
+responses and errors are `no-store`; no plaintext diagnostic body is forwarded.
 
 ## Caching
 
-The public GET reads (`gas-quote`, `supported-tokens`, `gas-tiers`, `gas-fee`)
+The public GET reads (`gas-quote`, `supported-tokens`, `gas-tiers`, `gas-history`, `gas-fee`)
 and the KeyConfig (`/ohttp-configs`) are cached by the relay itself, **honoring
 the paymaster's `Cache-Control`**:
 
@@ -76,6 +101,10 @@ the paymaster's `Cache-Control`**:
   `no-store`), and relay non-`200` answers with `Cache-Control: no-store`.
 - The cache is **shared across clients** (the responses are identity-free), which
   also reduces the request volume the paymaster sees.
+- Cache keys include the fixed target, separating scheduler and paymaster key
+  configurations. Upstream `Age` reduces the remaining lifetime; malformed or
+  exhausted ages and `Vary` disable caching. Only rebuilt cache metadata and the
+  expected content type are returned, not cookies, redirects, or trace headers.
 
 The **Go** relay uses a small in-memory TTL cache (`cache.go`); the **Worker**
 uses the Cloudflare edge cache (`caches.default`), which honors origin
@@ -94,7 +123,21 @@ cookies or browser credentials.
 | Env | Meaning |
 |---|---|
 | `OHTTP_GATEWAY_URL` | **required** — base URL of the paymaster's OHTTP gateway (e.g. `https://paymaster.internal`) |
+| `OHTTP_SCHEDULER_GATEWAY_URL` | Optional — distinct scheduler gateway base, e.g. `http://backend:8080/scheduler`. Unset disables scheduler routes. |
 | `RELAY_LISTEN` | bind address (default `:8080`) |
+
+Gateway bases are operator configuration, never request parameters. Credentials,
+query strings, fragments, and encoded/traversing paths are rejected. Use HTTPS
+for external gateways; plain HTTP is supported only for an operator-managed
+trusted internal hop. The caller remains responsible for deployment TLS and
+network isolation. `New(gatewayURL, client)` remains paymaster-only;
+`NewWithScheduler(gatewayURL, schedulerURL, client)` returns configuration errors.
+
+Scheduler activation requires a separately provisioned gateway, signing pin,
+and ingress route. The public API's existing root `/ohttp-configs` and `/gateway`
+point to the paymaster; they are **not** valid scheduler targets. Merely adding
+these relay routes does not activate scheduled payments or change deployment
+configuration. The proposed external namespace needs its own deployment gate.
 
 ## Paymaster discovery
 
@@ -171,6 +214,11 @@ proxy.
 > strongest guarantee. If you deploy the Worker, the paymaster ingress must strip
 > `CF-Connecting-IP`/`X-Forwarded-For`/`X-Real-IP`/`True-Client-IP`. See
 > [`worker/README.md`](worker/README.md).
+
+Local synthetic tests verify the Go application boundary, not a deployed CDN or
+ingress. Before claiming deployed IP separation, inspect receiver headers with
+synthetic non-account probes before access-log retention. Keep wallet payloads,
+capabilities, addresses, and real client identifiers out of diagnostic captures.
 
 ## See also
 
