@@ -32,11 +32,38 @@ const MAX_SCHEDULER_REQUEST = 4 << 20;
 const MAX_CONCURRENCY = 128;
 // Leave headroom for the runtime/cache and stream-copy overhead within an
 // isolate. A request-count cap alone is unsafe for 4 MiB scheduler uploads.
-const MAX_BUFFERED_WORK = 32 << 20;
+// The budget is per ISOLATE, shared by every caller routed to it.
+export const MAX_BUFFERED_WORK = 32 << 20;
 // Per-route, per-source rate-limit buckets: PPOI sync (3 concurrent
 // 50-commitment batches) must not starve paymaster status polling, and vice versa.
 const BUCKET_LIMITS = { paymaster: 60, scheduler: 60, ppoi: 180 } as const;
 type Bucket = keyof typeof BUCKET_LIMITS;
+// Per-route body caps; each request reserves buffer budget from ITS route's caps.
+// paymaster and scheduler match the backend gateway limits (decap.PaymasterRequestLimit
+// 1 MiB, SchedulerRequestLimit 4 MiB, ResponseLimit 1 MiB) and are unchanged.
+// PPOI carries small sealed JSON-RPC envelopes (SDK batches: 50 blinded
+// commitments per ppoi_pois_per_list, 20 legacy proofs per submit; measured
+// worst cases: request ~7 KB, response ~68 KB for a 50-proof ppoi_merkle_proofs,
+// ~18 KB for the 13-input maximum of a real spend). The caps are 9x / 3.9x
+// those worst cases (14x for the real 13-input response). A body above a cap
+// still fails cleanly: 413 for a request, 502 for a response, never truncated.
+export const ROUTE_LIMITS: Record<Bucket, { request: number; response: number }> = {
+  paymaster: { request: MAX_BODY, response: MAX_BODY },
+  scheduler: { request: MAX_SCHEDULER_REQUEST, response: MAX_BODY },
+  ppoi: { request: 64 << 10, response: 256 << 10 },
+};
+/**
+ * Worst-case bytes one request pins in the isolate while it runs. Both bodies
+ * are read with readBounded, which holds the received chunks AND the
+ * concatenated copy at once. A sealed request body is therefore reserved 2x
+ * (chunks + copy handed to fetch), and a response 3x (chunks + copy + the
+ * Response/cache.put clone built from it). Config and public reads have no
+ * request body, so only the 3x response term applies.
+ */
+export function bufferReservation(bucket: Bucket, gateway: boolean): number {
+  const { request, response } = ROUTE_LIMITS[bucket];
+  return (gateway ? 2 * request : 0) + 3 * response;
+}
 // Sealed routes nest above the backend gateway ladder (handler 25 s < forwarder
 // 28 s < gateway 30-35 s < relay 40 s); public reads and key configs keep 20 s.
 const SEALED_TIMEOUT_MS = 40_000;
@@ -378,8 +405,8 @@ export function createRelayHandler(options: RelayOptions = {}) {
       const bucket: Bucket = ppoi ? "ppoi" : scheduler ? "scheduler" : "paymaster";
       if (!base || (scheduler && base === paymasterBase) ||
           (ppoi && (base === paymasterBase || base === targetBase(env.SCHEDULER_TARGET)))) return fail(503, "gateway unavailable");
-      const requestLimit = scheduler ? MAX_SCHEDULER_REQUEST : MAX_BODY;
-      const reservation = (gateway ? 2 * requestLimit : 0) + 3 * MAX_BODY;
+      const { request: requestLimit, response: responseLimit } = ROUTE_LIMITS[bucket];
+      const reservation = bufferReservation(bucket, gateway);
       if (activeRequests >= (options.maxConcurrency ?? MAX_CONCURRENCY) ||
           reservedBytes + reservation > MAX_BUFFERED_WORK) return fail(503, "relay busy");
 
@@ -438,7 +465,7 @@ export function createRelayHandler(options: RelayOptions = {}) {
           void upstream.body?.cancel().catch(() => {});
           return fail(502, "invalid gateway response");
         }
-        const body = await readBounded(upstream.body, upstream.headers, MAX_BODY, signal, 502);
+        const body = await readBounded(upstream.body, upstream.headers, responseLimit, signal, 502);
         if (!body.length) return fail(502, "empty gateway response");
         const headers: Record<string, string> = { "Content-Type": expectedType, "Cache-Control": "no-store" };
         if (!gateway) headers["Cache-Control"] = publicCacheControl(upstream.headers) ?? "no-store";

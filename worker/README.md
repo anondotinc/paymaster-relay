@@ -56,8 +56,9 @@ verification.
 - `GET /ppoi/ohttp-configs` and `POST /ppoi/gateway` → the PPOI OHTTP gateway's
   `/ohttp-configs` and `/gateway` under `PPOI_TARGET`. Unset: `404`. Set but
   invalid, or sharing a base with `TARGET`/`SCHEDULER_TARGET`: `503`, never a
-  paymaster response. Same keyless handling and 1 MiB limits as the paymaster
-  route; PPOI clients use their own signing-key pin.
+  paymaster response. Same keyless handling as the paymaster route but with
+  small PPOI body caps (64 KiB request, 256 KiB response, see Limits); PPOI
+  clients use their own signing-key pin.
 - `GET /scheduler/ohttp-configs` and `POST /scheduler/gateway` → the **separate**
   scheduler gateway's `/ohttp-configs` and `/gateway` under `SCHEDULER_TARGET`.
   Without a distinct, valid scheduler target these return `503`, never a
@@ -89,6 +90,11 @@ relay does not use cookies or browser credentials.
 
 - Paymaster sealed uploads and all upstream responses: **1 MiB**. Scheduler
   uploads: **4 MiB**, allowing overhead for a 2 MiB serialized payment bundle.
+  PPOI (`/ppoi/*`): **64 KiB** request, **256 KiB** response. Its sealed bodies
+  are small JSON-RPC envelopes (worst measured: ~7 KB request, ~68 KB response
+  for a 50-proof `ppoi_merkle_proofs`; the SDK sends 50 commitments per lookup
+  and 20 legacy proofs per submit). A larger body fails with `413` (request) or
+  `502` (response), never truncated.
 - Streams are bounded during consumption, including when `Content-Length` is
   absent. Wrong MIME, truncation, unsupported encoding, redirects, and
   non-success upstream responses fail closed. Upstream requests explicitly ask
@@ -99,9 +105,13 @@ relay does not use cookies or browser credentials.
   Accepted sealed requests have a 40-second deadline (above the backend gateway
   ladder: handler 25 s < forwarder 28 s < gateway 30-35 s < relay 40 s); key
   configs and public reads keep 20 seconds. Both follow caller cancellation.
-  Each sealed request reserves 5 MiB of the 32 MiB budget (about 6 concurrent
-  sealed requests per isolate); POI sync runs 3 concurrent requests, so it fits
-  but shares that budget with paymaster traffic.
+  A request reserves, from its own route's caps, `2 x request cap` (sealed
+  upload only: received chunks plus the concatenated copy handed to `fetch`)
+  plus `3 x response cap` (chunks, concatenated copy, and the Response/cache
+  clone built from it). Paymaster 5 MiB (6 concurrent sealed requests per
+  isolate), scheduler 11 MiB (2), PPOI 896 KiB (36). The budget is shared by
+  every caller routed to the isolate. POI sync runs 3 concurrent batches per
+  client and the mobile app fires ~8 sealed requests at startup; both fit.
   Process-local, salted per-source buckets are kept per route: paymaster 60,
   scheduler 60 and PPOI 180 requests per minute, so PPOI sync cannot starve
   paymaster polling; this is load protection, not a global rate-limit guarantee.

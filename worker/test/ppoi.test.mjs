@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createRelayHandler } from "../src/index.ts";
+import { MAX_BUFFERED_WORK, ROUTE_LIMITS, bufferReservation, createRelayHandler } from "../src/index.ts";
 
 const CONFIG_TYPE = "application/ohttp-keys-signed";
 const REQUEST_TYPE = "message/ohttp-req";
@@ -143,4 +143,111 @@ test("sealed routes get a 40 s deadline; configs and public reads keep 20 s", as
     globalThis.setTimeout = realSetTimeout;
   }
   assert.deepEqual(delays, [40_000, 40_000, 40_000, 20_000, 20_000]);
+});
+
+// ---- isolate buffer budget (incident 2026-10-06) ---------------------------
+// A mobile start fires ~8 concurrent sealed POSTs; the relay answered 4 of them
+// "503 relay busy" because every sealed request reserved 5 MiB of a 32 MiB
+// per-isolate budget (6 requests). PPOI now reserves from its own, small caps.
+
+const sealedBody = (path, body, headers = {}) => req(path, {
+  method: "POST", headers: { "Content-Type": REQUEST_TYPE, "CF-Connecting-IP": "192.0.2.1", ...headers }, body, duplex: "half",
+});
+const KiB = 1 << 10;
+const MiB = 1 << 20;
+const pending = (calls, count) => new Promise((resolve, reject) => {
+  const deadline = Date.now() + 5_000;
+  const poll = () => calls.length >= count ? resolve() : Date.now() > deadline
+    ? reject(new Error(`only ${calls.length}/${count} requests reached the upstream`))
+    : setTimeout(poll, 1);
+  poll();
+});
+/** A fixture whose upstream answers only when released, like a slow gateway. */
+function slowFixture(options = {}) {
+  const releases = [];
+  const handler = createRelayHandler({
+    cache: null,
+    fetch: (url, init) => new Promise(resolve => { releases.push(() => resolve(response())); calls.push({ url, init }); }),
+    ...options,
+  });
+  const calls = [];
+  return { calls, releases, send: (request, config = env) => handler.fetch(request, config, ctx) };
+}
+
+test("reservation per request and the resulting per-isolate capacity", () => {
+  const capacity = (bucket, gateway) => Math.floor(MAX_BUFFERED_WORK / bufferReservation(bucket, gateway));
+  // Paymaster and scheduler are unchanged: 2 * request + 3 * response.
+  assert.equal(bufferReservation("paymaster", true), 5 * MiB);
+  assert.equal(bufferReservation("scheduler", true), 11 * MiB);
+  assert.equal(bufferReservation("paymaster", false), 3 * MiB);
+  assert.equal(capacity("paymaster", true), 6);
+  assert.equal(capacity("scheduler", true), 2);
+  // PPOI: 2 * 64 KiB + 3 * 256 KiB.
+  assert.deepEqual(ROUTE_LIMITS.ppoi, { request: 64 * KiB, response: 256 * KiB });
+  assert.equal(bufferReservation("ppoi", true), 896 * KiB);
+  assert.equal(bufferReservation("ppoi", false), 768 * KiB);
+  assert.equal(capacity("ppoi", true), 36);
+  assert.ok(capacity("ppoi", true) >= 32);
+  // The 2x / 3x multipliers still apply, and nothing grew.
+  assert.equal(MAX_BUFFERED_WORK, 32 * MiB);
+  assert.equal(ROUTE_LIMITS.scheduler.request, 4 * MiB);
+});
+
+test("32+ concurrent sealed ppoi requests with slow upstreams are all admitted; the budget still trips beyond it", async () => {
+  const capacity = Math.floor(MAX_BUFFERED_WORK / bufferReservation("ppoi", true));
+  const { send, calls, releases } = slowFixture();
+  // Incident shape first: 8 concurrent sealed POSTs from one client.
+  // (One source stays well inside the 180/min ppoi bucket.)
+  const inflight = [];
+  for (let i = 0; i < capacity; i += 1) inflight.push(send(post("/ppoi/gateway")));
+  await pending(calls, capacity);
+  assert.ok(calls.length >= 32, `only ${calls.length} admitted`);
+  // Every admitted request is in flight at the gateway; the next one is the first refused.
+  const refused = await send(post("/ppoi/gateway", "192.0.2.77"));
+  assert.equal(refused.status, 503);
+  assert.equal(await refused.text(), "relay busy");
+  assert.equal(calls.length, capacity);
+  for (const release of releases) release();
+  for (const result of await Promise.all(inflight)) assert.equal(result.status, 200);
+  // Capacity is returned after completion.
+  const again = send(post("/ppoi/gateway"));
+  await pending(calls, capacity + 1);
+  releases.at(-1)();
+  assert.equal((await again).status, 200);
+});
+
+test("slow ppoi uploads hold their reservation, so they cannot evade the cap", async () => {
+  const capacity = Math.floor(MAX_BUFFERED_WORK / bufferReservation("ppoi", true));
+  const { send, calls } = slowFixture({ timeoutMs: 60 });
+  const stalled = () => sealedBody("/ppoi/gateway", new ReadableStream());
+  const uploads = Array.from({ length: capacity }, () => send(stalled()));
+  assert.equal((await send(post("/ppoi/gateway", "192.0.2.9"))).status, 503);
+  for (const result of await Promise.all(uploads)) assert.equal(result.status, 504);
+  assert.equal(calls.length, 0);
+});
+
+test("ppoi bodies above the route caps fail cleanly; bodies at the cap pass", async () => {
+  const { request, response: responseLimit } = ROUTE_LIMITS.ppoi;
+  const body = (size) => sealedBody("/ppoi/gateway", new Uint8Array(size));
+  const { send, calls } = fixture();
+  assert.equal((await send(body(request))).status, 200);
+  assert.equal((await send(body(request + 1))).status, 413);
+  const announced = sealedBody("/ppoi/gateway", new Uint8Array(2), { "Content-Length": String(request + 1) });
+  assert.equal((await send(announced)).status, 413);
+  assert.equal(calls.length, 1);
+  // The paymaster route keeps its 1 MiB request cap.
+  assert.equal((await send(sealedBody("/gateway", new Uint8Array(request + 1)))).status, 200);
+
+  const big = (size, type = RESPONSE_TYPE) => new Response(new Uint8Array(size), { status: 200, headers: { "Content-Type": type } });
+  const atCap = fixture({ fetch: async () => big(responseLimit) });
+  assert.equal((await atCap.send(post("/ppoi/gateway"))).status, 200);
+  const over = fixture({ fetch: async () => big(responseLimit + 1) });
+  assert.equal((await over.send(post("/ppoi/gateway"))).status, 502);
+  const announcedOver = fixture({ fetch: async () => new Response(new Uint8Array(4), { status: 200, headers: { "Content-Type": RESPONSE_TYPE, "Content-Length": String(responseLimit + 1) } }) });
+  assert.equal((await announcedOver.send(post("/ppoi/gateway"))).status, 502);
+  const overConfig = fixture({ fetch: async () => big(responseLimit + 1, CONFIG_TYPE) });
+  assert.equal((await overConfig.send(get("/ppoi/ohttp-configs"))).status, 502);
+  // The paymaster response cap is unchanged: the same body is fine there.
+  const paymaster = fixture({ fetch: async () => big(responseLimit + 1) });
+  assert.equal((await paymaster.send(post("/gateway"))).status, 200);
 });
