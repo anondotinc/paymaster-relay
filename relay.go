@@ -21,7 +21,11 @@ const (
 	ctConfigs        = "application/ohttp-keys-signed"
 	maxBody          = 1 << 20
 	maxSchedulerBody = 4 << 20
-	upstreamTimeout  = 20 * time.Second
+	// upstreamTimeout bounds public GET reads and key configs. sealedTimeout
+	// bounds sealed POSTs and nests above the backend gateway ladder (handler
+	// 25 s < forwarder 28 s < gateway 30-35 s < relay 40 s).
+	upstreamTimeout = 20 * time.Second
+	sealedTimeout   = 40 * time.Second
 )
 
 var publicReadPaths = []string{
@@ -34,6 +38,7 @@ type relayRoute struct {
 	target       string
 	responseType string
 	requestLimit int64
+	bucket       string
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -62,6 +67,15 @@ func New(gatewayURL string, client *http.Client) http.Handler {
 // NewWithScheduler adds opt-in scheduler routes. Each base is fixed by the
 // operator; clients cannot select targets. Gateways retain their separate keys.
 func NewWithScheduler(gatewayURL, schedulerURL string, client *http.Client) (http.Handler, error) {
+	return NewWithTargets(gatewayURL, schedulerURL, "", client)
+}
+
+// NewWithTargets adds the opt-in scheduler routes (/scheduler/*) and PPOI
+// routes (/ppoi/*). Each target is disabled (404) when empty, must be a valid
+// base that is distinct from the paymaster's and from the other opt-in target,
+// and is never inferred from another. Each route family has its own per-source
+// rate-limit bucket (paymaster, scheduler, ppoi).
+func NewWithTargets(gatewayURL, schedulerURL, ppoiURL string, client *http.Client) (http.Handler, error) {
 	var err error
 	gatewayURL, err = validateGatewayURL(gatewayURL)
 	if err != nil {
@@ -76,17 +90,30 @@ func NewWithScheduler(gatewayURL, schedulerURL string, client *http.Client) (htt
 			return nil, errors.New("scheduler requires a distinct gateway base")
 		}
 	}
+	if ppoiURL != "" {
+		ppoiURL, err = validateGatewayURL(ppoiURL)
+		if err != nil {
+			return nil, err
+		}
+		if ppoiURL == gatewayURL || ppoiURL == schedulerURL {
+			return nil, errors.New("ppoi requires a distinct gateway base")
+		}
+	}
 	var routes = map[string]relayRoute{
 		"/health":        {method: http.MethodGet},
-		"/ohttp-configs": {method: http.MethodGet, target: gatewayURL + "/ohttp-configs", responseType: ctConfigs},
-		"/gateway":       {method: http.MethodPost, target: gatewayURL + "/gateway", responseType: ctRes, requestLimit: maxBody},
+		"/ohttp-configs": {method: http.MethodGet, target: gatewayURL + "/ohttp-configs", responseType: ctConfigs, bucket: bucketPaymaster},
+		"/gateway":       {method: http.MethodPost, target: gatewayURL + "/gateway", responseType: ctRes, requestLimit: maxBody, bucket: bucketPaymaster},
 	}
 	for _, routePath := range publicReadPaths {
-		routes[routePath] = relayRoute{method: http.MethodGet, target: gatewayURL + routePath, responseType: "application/json"}
+		routes[routePath] = relayRoute{method: http.MethodGet, target: gatewayURL + routePath, responseType: "application/json", bucket: bucketPaymaster}
 	}
 	if schedulerURL != "" {
-		routes["/scheduler/ohttp-configs"] = relayRoute{method: http.MethodGet, target: schedulerURL + "/ohttp-configs", responseType: ctConfigs}
-		routes["/scheduler/gateway"] = relayRoute{method: http.MethodPost, target: schedulerURL + "/gateway", responseType: ctRes, requestLimit: maxSchedulerBody}
+		routes["/scheduler/ohttp-configs"] = relayRoute{method: http.MethodGet, target: schedulerURL + "/ohttp-configs", responseType: ctConfigs, bucket: bucketScheduler}
+		routes["/scheduler/gateway"] = relayRoute{method: http.MethodPost, target: schedulerURL + "/gateway", responseType: ctRes, requestLimit: maxSchedulerBody, bucket: bucketScheduler}
+	}
+	if ppoiURL != "" {
+		routes["/ppoi/ohttp-configs"] = relayRoute{method: http.MethodGet, target: ppoiURL + "/ohttp-configs", responseType: ctConfigs, bucket: bucketPPOI}
+		routes["/ppoi/gateway"] = relayRoute{method: http.MethodPost, target: ppoiURL + "/gateway", responseType: ctRes, requestLimit: maxBody, bucket: bucketPPOI}
 	}
 	var cache = newTTLCache()
 	var safeguards = newRelaySafeguards()
@@ -96,7 +123,9 @@ func NewWithScheduler(gatewayURL, schedulerURL string, client *http.Client) (htt
 	// their own mux and fresh-only proxy, and are not behind the sealed-route
 	// safeguards (identity-free, cached for seconds, canonical key space).
 	var gasReads = http.NewServeMux()
-	handleGasReads(gasReads, client, cache, gatewayURL)
+	var gasClient = *client
+	gasClient.Timeout = upstreamTimeout
+	handleGasReads(gasReads, &gasClient, cache, gatewayURL)
 	return withCORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		if isGasReadPath(r.URL.Path) {
@@ -139,7 +168,7 @@ func NewWithScheduler(gatewayURL, schedulerURL string, client *http.Client) (htt
 		if requestLimit == 0 {
 			requestLimit = maxBody
 		}
-		safeguards.gatewayWithLimit(requestLimit, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		safeguards.gatewayWithLimit(route.bucket, requestLimit, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if route.method == http.MethodGet {
 				if query != "" {
 					route.target += "?" + query
@@ -228,14 +257,18 @@ func relayHTTPClient(original *http.Client) *http.Client {
 	}
 	client.Jar = nil
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	if client.Timeout <= 0 || client.Timeout > upstreamTimeout {
-		client.Timeout = upstreamTimeout
+	if client.Timeout <= 0 || client.Timeout > sealedTimeout {
+		client.Timeout = sealedTimeout
 	}
 	return &client
 }
 
 func upstreamRequest(r *http.Request, method, target, accept string, body io.Reader) (*http.Request, context.CancelFunc, error) {
-	var ctx, cancel = context.WithTimeout(r.Context(), upstreamTimeout)
+	var timeout = upstreamTimeout
+	if method == http.MethodPost {
+		timeout = sealedTimeout
+	}
+	var ctx, cancel = context.WithTimeout(r.Context(), timeout)
 	var request, err = http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		cancel()

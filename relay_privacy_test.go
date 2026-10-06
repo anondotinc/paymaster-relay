@@ -332,7 +332,7 @@ func TestPrivacyCacheDoesNotResetUpstreamAge(t *testing.T) {
 
 func TestPrivacyUpstreamDeadlineAndCancellation(t *testing.T) {
 	var client = relayHTTPClient(&http.Client{Timeout: time.Hour})
-	if client.Timeout != upstreamTimeout || client.Jar != nil {
+	if client.Timeout != sealedTimeout || client.Jar != nil {
 		t.Fatal("client protections missing")
 	}
 	var observed bool
