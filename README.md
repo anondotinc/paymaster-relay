@@ -64,8 +64,9 @@ access to paymaster secrets.
 - `GET /ppoi/ohttp-configs` and `POST /ppoi/gateway` are available **only when
   `PPOI_TARGET` is set** (404 otherwise). They forward to
   `${PPOI_TARGET}/ohttp-configs` and `${PPOI_TARGET}/gateway` (production:
-  `https://proxy.anon.inc/ohttp`) with the same keyless, no-log, 1 MiB handling
-  as the paymaster's sealed route, and cacheable key configs. The target must
+  `https://proxy.anon.inc/ohttp`) with the same keyless, no-log handling
+  as the paymaster's sealed route (the Worker variant applies smaller PPOI body
+  caps; see `worker/README.md`), and cacheable key configs. The target must
   not share a base with the paymaster or scheduler; the PPOI gateway holds its
   own keys, so clients pin a separate PPOI signing key.
 - `GET /scheduler/ohttp-configs` and `POST /scheduler/gateway` are available
