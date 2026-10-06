@@ -7,3 +7,6 @@ routes = [
 
 [vars]
 TARGET = "https://api.anon.inc"
+# SCHEDULER_TARGET is deliberately unset: scheduler relay activation requires a
+# dedicated backend OHTTP gateway and independently verified scheduler key pin.
+# Do not point it at TARGET (whose /gateway routes to the paymaster).

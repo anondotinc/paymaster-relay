@@ -1,90 +1,198 @@
-export interface Env { TARGET: string } // the paymaster gateway base URL
+export interface Env {
+  TARGET: string;
+  /** Optional dedicated scheduler gateway. Never inferred from TARGET. */
+  SCHEDULER_TARGET?: string;
+}
 
-// ⚠️ SECURITY CAVEAT — client IP on Cloudflare subrequests.
-// When a Worker fetch() targets a NON-Cloudflare origin, Cloudflare injects the
-// real eyeball IP into `CF-Connecting-IP` (and `X-Forwarded-For`), and
-// `CF-Connecting-IP` is NOT alterable for non-Cloudflare zones. So THIS Worker
-// variant cannot, by itself, fully hide the client IP from the paymaster — the
-// whole point of the relay. We override X-Real-IP below (which suppresses
-// X-Forwarded-For), but CF-Connecting-IP still carries the client IP.
-// Therefore, to use the Worker variant safely you MUST ensure the paymaster's
-// ingress STRIPS CF-Connecting-IP / X-Forwarded-For / X-Real-IP / True-Client-IP
-// before any logging or processing (the paymaster app already ignores them).
-// For the strongest guarantee with no such dependency, run the Go+Docker relay
-// (relay.go) — it forwards no client headers at all.
-const STRIP_IP_HEADERS: Record<string, string> = { "X-Real-IP": "0.0.0.0" };
-const MAX_GATEWAY_BODY = 1 << 20;
-const MAX_GATEWAY_CONCURRENCY = 128;
+interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
+interface RelayCache {
+  match(request: Request): Promise<Response | undefined>;
+  put(request: Request, response: Response): Promise<void>;
+}
+interface RelayOptions {
+  fetch?: typeof globalThis.fetch;
+  cache?: RelayCache | null;
+  timeoutMs?: number;
+  maxConcurrency?: number;
+}
+
+// SECURITY CAVEAT: Cloudflare may inject the visitor IP into subrequests AFTER
+// these application-level header choices, particularly to non-Cloudflare
+// origins. This override is not proof of IP separation. Both gateways' ingress
+// and logging paths must be independently verified before making that claim.
+const STRIP_IP_HEADERS = { "X-Real-IP": "0.0.0.0" };
+const MAX_BODY = 1 << 20;
+const MAX_SCHEDULER_REQUEST = 4 << 20;
+const MAX_CONCURRENCY = 128;
+// Leave headroom for the runtime/cache and stream-copy overhead within an
+// isolate. A request-count cap alone is unsafe for 4 MiB scheduler uploads.
+const MAX_BUFFERED_WORK = 32 << 20;
 const MAX_SOURCE_REQUESTS_PER_MINUTE = 60;
-const GATEWAY_TIMEOUT_MS = 20_000;
-
-const sourceWindows = new Map<string, { started: number; count: number }>();
-// Workers refuse random values in global scope (deploy error 10021), so the
-// per-isolate salt is drawn on the first request instead of at load.
-let sourceSalt: Uint8Array | undefined;
-let activeGatewayRequests = 0;
-
-function isolateSalt(): Uint8Array {
-  sourceSalt ??= crypto.getRandomValues(new Uint8Array(32));
-  return sourceSalt;
-}
-
-async function ephemeralSourceKey(req: Request): Promise<string> {
-  const source = req.headers.get("CF-Connecting-IP") ?? "unknown";
-  const sourceBytes = new TextEncoder().encode(source);
-  const salt = isolateSalt();
-  const material = new Uint8Array(salt.length + sourceBytes.length);
-  material.set(salt);
-  material.set(sourceBytes, salt.length);
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", material));
-  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function sourceAllowed(req: Request): Promise<boolean> {
-  const now = Date.now();
-  if (sourceWindows.size > 10_000) {
-    for (const [key, window] of sourceWindows) {
-      if (now - window.started >= 60_000) sourceWindows.delete(key);
-    }
-    if (sourceWindows.size > 10_000) {
-      sourceWindows.delete(sourceWindows.keys().next().value as string);
-    }
-  }
-  const key = await ephemeralSourceKey(req);
-  const window = sourceWindows.get(key);
-  if (!window || now - window.started >= 60_000) {
-    sourceWindows.set(key, { started: now, count: 1 });
-    return true;
-  }
-  if (window.count >= MAX_SOURCE_REQUESTS_PER_MINUTE) return false;
-  window.count += 1;
-  return true;
-}
-
-const CORS_HEADERS: Record<string, string> = {
+const TIMEOUT_MS = 20_000;
+const CONFIG_TYPE = "application/ohttp-keys-signed";
+const REQUEST_TYPE = "message/ohttp-req";
+const RESPONSE_TYPE = "message/ohttp-res";
+const QUOTE_PATH = "/api/v1/paymaster/gas-quote";
+const TOKENS_PATH = "/api/v1/paymaster/supported-tokens";
+const CHAINS = new Set(["1", "56", "137", "42161"]);
+const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
   "Access-Control-Max-Age": "86400",
 };
 
+class RelayFailure extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function reply(body: BodyInit | null, status = 200, headers: HeadersInit = {}): Response {
+  const safeHeaders = new Headers(headers);
+  for (const [name, value] of Object.entries(CORS_HEADERS)) safeHeaders.set(name, value);
+  if (!safeHeaders.has("Cache-Control")) safeHeaders.set("Cache-Control", "no-store");
+  return new Response(body, { status, headers: safeHeaders });
+}
+
+function fail(status: number, message: string): Response {
+  return reply(message, status, { "Content-Type": "text/plain; charset=utf-8" });
+}
+
+function targetBase(value: string | undefined): string | undefined {
+  if (!value || value !== value.trim() || /[\\%?#]/.test(value) || /\/(?:\.|\.\.)(?:\/|$)/.test(value)) return undefined;
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password ||
+        url.search || url.hash || url.pathname.includes("%") || url.pathname.includes("//")) return undefined;
+    return url.href.replace(/\/+$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
+/** Only fixed protobuf read fields cross the public, unsealed query surface. */
+function canonicalQuery(path: string, url: URL): string {
+  if (path !== QUOTE_PATH && path !== TOKENS_PATH) {
+    if (url.search) throw new RelayFailure(400, "query parameters not allowed");
+    return "";
+  }
+  if (url.search.slice(1).length > 128) throw new RelayFailure(400, "query too large");
+  const chainValues = [...url.searchParams.getAll("chainId"), ...url.searchParams.getAll("chain_id")];
+  for (const key of url.searchParams.keys()) {
+    if (key !== "chainId" && key !== "chain_id" && !(path === QUOTE_PATH && key === "priority")) {
+      throw new RelayFailure(400, "unknown query parameter");
+    }
+  }
+  if (chainValues.length !== 1) {
+    throw new RelayFailure(400, "invalid chain");
+  }
+  const chain = chainValues[0];
+  if (!CHAINS.has(chain)) throw new RelayFailure(400, "unsupported chain");
+  const priorities = url.searchParams.getAll("priority");
+  if (priorities.length > 1) throw new RelayFailure(400, "duplicate priority");
+  const priority = priorities[0]?.toLowerCase();
+  if (priority && !["slow", "normal", "fast"].includes(priority)) throw new RelayFailure(400, "invalid priority");
+  const query = new URLSearchParams({ chainId: chain });
+  if (priority) query.set("priority", priority);
+  return "?" + query.toString();
+}
+
 function withCors(response: Response): Response {
   const headers = new Headers(response.headers);
   for (const [name, value] of Object.entries(CORS_HEADERS)) headers.set(name, value);
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function declaredLength(headers: Headers, limit: number, status: number): number | undefined {
+  const raw = headers.get("Content-Length");
+  if (raw == null) return undefined;
+  if (!/^[0-9]+$/.test(raw)) throw new RelayFailure(400, "invalid body length");
+  const length = Number(raw);
+  if (!Number.isSafeInteger(length) || length > limit) throw new RelayFailure(status, "body too large");
+  return length;
+}
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    void promise.catch(() => {});
+    return Promise.reject(signal.reason);
+  }
+  return new Promise((resolve, reject) => {
+    const abort = () => { cleanup(); reject(signal.reason); };
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
   });
 }
 
-// Public, cacheable, identity-free GET reads the relay proxies so the client
-// fetches them via the relay, never the paymaster directly. Keep in sync with
-// publicReadPaths in relay.go.
-const PUBLIC_READ_PATHS = new Set<string>([
-  "/api/v1/paymaster/gas-quote",
-  "/api/v1/paymaster/supported-tokens",
-]);
+/** Bound the stream while reading; neither request nor response uses arrayBuffer(). */
+async function readBounded(
+  body: ReadableStream<Uint8Array> | null,
+  headers: Headers,
+  limit: number,
+  signal: AbortSignal,
+  tooLargeStatus: number,
+): Promise<Uint8Array> {
+  let expected: number | undefined;
+  try {
+    expected = declaredLength(headers, limit, tooLargeStatus);
+  } catch (error) {
+    void body?.cancel().catch(() => {});
+    throw error;
+  }
+  if (!body) {
+    if (expected) throw new RelayFailure(400, "truncated body");
+    return new Uint8Array();
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await abortable(reader.read(), signal);
+      if (done) break;
+      length += value.byteLength;
+      if (length > limit) throw new RelayFailure(tooLargeStatus, "body too large");
+      chunks.push(value);
+    }
+    if (expected != null && expected !== length) throw new RelayFailure(400, "truncated body");
+    const result = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
+    completed = true;
+    return result;
+  } finally {
+    if (!completed) void reader.cancel().catch(() => {});
+    try { reader.releaseLock(); } catch { /* pending aborted reads are cancelled above */ }
+  }
+}
+
+function contentType(response: Response, expected: string): boolean {
+  const type = response.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+  const encoding = response.headers.get("Content-Encoding")?.trim().toLowerCase();
+  return type === expected && (!encoding || encoding === "identity");
+}
+
+/** Rebuild cache metadata too: never copy Set-Cookie, tracing or identity headers. */
+function publicCacheControl(headers: Headers): string | undefined {
+  if (headers.get("Vary")) return undefined;
+  const directives = (headers.get("Cache-Control") ?? "").toLowerCase().split(",").map(value => value.trim());
+  if (directives.some(value => ["no-store", "no-cache", "private"].includes(value.split("=")[0].trim()))) return undefined;
+  const max = directives.find(value => value.startsWith("s-maxage=")) ?? directives.find(value => value.startsWith("max-age="));
+  const text = max?.split("=")[1];
+  if (!text || !/^[0-9]+$/.test(text)) return undefined;
+  const ageText = headers.get("Age") ?? "0";
+  if (!/^[0-9]+$/.test(ageText)) return undefined;
+  const lifetime = Number(text);
+  const age = Number(ageText);
+  if (!Number.isSafeInteger(lifetime) || !Number.isSafeInteger(age)) return undefined;
+  const remaining = lifetime - age;
+  return remaining > 0 ? `public, max-age=${remaining}` : undefined;
+}
 
 // Public gas reads: the paymaster's gas tiers and gas history and the API's
 // network base fee. All are identity-free and fresh-only (the API answers
@@ -144,103 +252,195 @@ function remainingFreshness(headers: Headers): number {
   return Number.isSafeInteger(remaining) && remaining > 0 ? remaining : 0;
 }
 
-/**
- * Serve a validated gas read through the edge cache. A 200 is cached for what
- * is left of the API's freshness (never extended); errors pass through with
- * `no-store` and are never cached. Response headers are rebuilt: no cookies,
- * Vary or tracing headers from the API reach the client or the cache.
- */
-async function gasRead(target: string, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const cache = caches.default;
-  const cacheKey = new Request(url.origin + target, { method: "GET" });
-  const cached = await cache.match(cacheKey);
-  if (cached) return withCors(cached);
-  let upstream: Response;
-  try {
-    upstream = await fetch(env.TARGET + target, { headers: STRIP_IP_HEADERS, redirect: "manual" });
-  } catch {
-    return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
-  }
-  if (upstream.status < 200 || upstream.status >= 300 && upstream.status < 400) {
-    void upstream.body?.cancel().catch(() => {});
-    return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
-  }
-  const fresh = upstream.status === 200 ? remainingFreshness(upstream.headers) : 0;
-  const headers = new Headers({
-    "Cache-Control": fresh > 0 ? `public, max-age=${fresh}` : "no-store",
-    "X-Content-Type-Options": "nosniff",
-  });
-  const contentType = upstream.headers.get("Content-Type");
-  if (contentType) headers.set("Content-Type", contentType);
-  const response = new Response(upstream.body, { status: upstream.status, headers });
-  if (fresh > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
-  return withCors(response);
+// Workers refuse random values in global scope (deploy error 10021), so the
+// per-isolate salt is drawn on the first request instead of at load.
+let sourceSalt: Uint8Array | undefined;
+
+function isolateSalt(): Uint8Array {
+  sourceSalt ??= crypto.getRandomValues(new Uint8Array(32));
+  return sourceSalt;
 }
 
-export default {
-  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(req.url);
-    if (req.method === "OPTIONS") {
-      return withCors(new Response(null, { status: 204 }));
-    }
-    if (url.pathname === "/health") return withCors(new Response("ok"));
+export function createRelayHandler(options: RelayOptions = {}) {
+  const sourceWindows = new Map<string, { started: number; count: number }>();
+  const fetchUpstream = options.fetch ?? ((...args: Parameters<typeof fetch>) => globalThis.fetch(...args));
+  let activeRequests = 0;
+  let reservedBytes = 0;
 
-    if (req.method === "GET") {
-      const target = gasReadTarget(url);
-      if (target === null) return withCors(new Response("invalid gas read", { status: 400, headers: NO_STORE }));
-      if (target !== undefined) return gasRead(target, url, env, ctx);
-    }
-
-    // /ohttp-configs + the public reads are cacheable GETs. Serve them through
-    // the edge cache, which honors the paymaster's Cache-Control (max-age /
-    // no-store) automatically — so we never serve a quote staler than the
-    // paymaster permits. Forward path+query only; no client headers, no PII.
-    if (
-      req.method === "GET" &&
-      (url.pathname === "/ohttp-configs" || PUBLIC_READ_PATHS.has(url.pathname))
-    ) {
-      const cache = caches.default;
-      const cacheKey = new Request(url.toString(), { method: "GET" });
-      let resp = await cache.match(cacheKey);
-      if (!resp) {
-        resp = await fetch(env.TARGET + url.pathname + url.search, { headers: STRIP_IP_HEADERS });
-        if (resp.status === 200) {
-          ctx.waitUntil(cache.put(cacheKey, resp.clone()));
-        }
+  async function sourceAllowed(req: Request): Promise<boolean> {
+    const salt = isolateSalt();
+    const now = Date.now();
+    if (sourceWindows.size >= 10_000) {
+      for (const [key, window] of sourceWindows) {
+        if (now - window.started >= 60_000) sourceWindows.delete(key);
       }
-      return withCors(resp);
+      if (sourceWindows.size >= 10_000) sourceWindows.delete(sourceWindows.keys().next().value as string);
     }
-    if (url.pathname === "/gateway" && req.method === "POST") {
-      if (req.headers.get("content-type") !== "message/ohttp-req")
-        return withCors(new Response("unsupported media type", { status: 415 }));
-      const contentLength = Number(req.headers.get("content-length") ?? "0");
-      if (Number.isFinite(contentLength) && contentLength > MAX_GATEWAY_BODY)
-        return withCors(new Response("request too large", { status: 413 }));
-      if (!(await sourceAllowed(req)))
-        return withCors(new Response("rate limited", { status: 429, headers: { "Retry-After": "60" } }));
-      if (activeGatewayRequests >= MAX_GATEWAY_CONCURRENCY)
-        return withCors(new Response("relay busy", { status: 503 }));
-      const body = await req.arrayBuffer();
-      if (body.byteLength > MAX_GATEWAY_BODY)
-        return withCors(new Response("request too large", { status: 413 }));
-      // Forward only the encapsulated body + content-type; no client headers.
-      // (X-Real-IP override suppresses X-Forwarded-For; see the CF-Connecting-IP
-      // caveat at the top of this file.)
-      activeGatewayRequests += 1;
+    const source = new TextEncoder().encode(req.headers.get("CF-Connecting-IP") ?? "unknown");
+    const material = new Uint8Array(salt.length + source.length);
+    material.set(salt);
+    material.set(source, salt.length);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", material));
+    const key = Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+    const window = sourceWindows.get(key);
+    if (!window || now - window.started >= 60_000) {
+      sourceWindows.set(key, { started: now, count: 1 });
+      return true;
+    }
+    if (window.count >= MAX_SOURCE_REQUESTS_PER_MINUTE) return false;
+    window.count += 1;
+    return true;
+  }
+
+  /**
+   * Serve a validated gas read through the edge cache. A 200 is cached for what
+   * is left of the API's freshness (never extended); errors pass through with
+   * `no-store` and are never cached. Response headers are rebuilt: no cookies,
+   * Vary or tracing headers from the API reach the client or the cache.
+   */
+  async function gasRead(target: string, url: URL, env: Env, ctx: WorkerContext): Promise<Response> {
+    const base = targetBase(env.TARGET);
+    if (!base) return fail(503, "gateway unavailable");
+    const cache = options.cache === undefined
+      ? (globalThis as typeof globalThis & { caches?: { default?: RelayCache } }).caches?.default
+      : options.cache;
+    const cacheKey = new Request(url.origin + target, { method: "GET" });
+    const cached = await cache?.match(cacheKey);
+    if (cached) return withCors(cached);
+    let upstream: Response;
+    try {
+      upstream = await fetchUpstream(base + target, { headers: STRIP_IP_HEADERS, redirect: "manual" });
+    } catch {
+      return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
+    }
+    if (upstream.status < 200 || upstream.status >= 300 && upstream.status < 400) {
+      void upstream.body?.cancel().catch(() => {});
+      return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
+    }
+    const fresh = upstream.status === 200 ? remainingFreshness(upstream.headers) : 0;
+    const headers = new Headers({
+      "Cache-Control": fresh > 0 ? `public, max-age=${fresh}` : "no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    const contentType = upstream.headers.get("Content-Type");
+    if (contentType) headers.set("Content-Type", contentType);
+    const response = new Response(upstream.body, { status: upstream.status, headers });
+    if (cache && fresh > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    return withCors(response);
+  }
+
+  return {
+    async fetch(req: Request, env: Env, ctx: WorkerContext): Promise<Response> {
+      const url = new URL(req.url);
+      const path = url.pathname;
+      // Public gas reads: validated, canonical, fresh-only; not behind the
+      // sealed-route limits (identity-free, cached for seconds).
+      const gasTarget = gasReadTarget(url);
+      if (gasTarget !== undefined && (req.method === "GET" || req.method === "OPTIONS")) {
+        if (req.method === "OPTIONS") return reply(null, 204);
+        if (gasTarget === null) return withCors(new Response("invalid gas read", { status: 400, headers: NO_STORE }));
+        return gasRead(gasTarget, url, env, ctx);
+      }
+      const scheduler = path === "/scheduler/ohttp-configs" || path === "/scheduler/gateway";
+      const keyConfig = path === "/ohttp-configs" || path === "/scheduler/ohttp-configs";
+      const gateway = path === "/gateway" || path === "/scheduler/gateway";
+      const publicRead = path === QUOTE_PATH || path === TOKENS_PATH;
+      if (!keyConfig && !gateway && !publicRead && path !== "/health") return fail(404, "not found");
+      let query: string;
+      try { query = canonicalQuery(path, url); } catch (error) {
+        return fail(error instanceof RelayFailure ? error.status : 400, "invalid query");
+      }
+      if (req.method === "OPTIONS") return reply(null, 204);
+      if (req.method !== (gateway ? "POST" : "GET")) return fail(405, "method not allowed");
+      if (path === "/health") return reply("ok");
+      if (gateway && req.headers.get("Content-Type") !== REQUEST_TYPE) return fail(415, "unsupported media type");
+      const requestEncoding = req.headers.get("Content-Encoding")?.trim().toLowerCase();
+      if (requestEncoding && requestEncoding !== "identity") return fail(415, "unsupported content encoding");
+      const paymasterBase = targetBase(env.TARGET);
+      const schedulerBase = targetBase(env.SCHEDULER_TARGET);
+      const base = scheduler ? schedulerBase : paymasterBase;
+      if (!base || (scheduler && base === paymasterBase)) return fail(503, "gateway unavailable");
+      const requestLimit = scheduler ? MAX_SCHEDULER_REQUEST : MAX_BODY;
+      const reservation = (gateway ? 2 * requestLimit : 0) + 3 * MAX_BODY;
+      if (activeRequests >= (options.maxConcurrency ?? MAX_CONCURRENCY) ||
+          reservedBytes + reservation > MAX_BUFFERED_WORK) return fail(503, "relay busy");
+
+      // Reserve before any awaits/body reads so slow uploads cannot evade the cap.
+      activeRequests += 1;
+      reservedBytes += reservation;
+      const controller = new AbortController();
+      const abort = () => controller.abort(req.signal.reason);
+      req.signal.addEventListener("abort", abort, { once: true });
+      if (req.signal.aborted) abort();
+      const timer = setTimeout(() => controller.abort(new Error("relay timeout")), options.timeoutMs ?? TIMEOUT_MS);
+      const signal = controller.signal;
       try {
-        const resp = await fetch(env.TARGET + "/gateway", {
-          method: "POST",
-          headers: { "content-type": "message/ohttp-req", ...STRIP_IP_HEADERS },
-          body,
-          signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
-        });
-        return withCors(new Response(resp.body, { status: resp.status, headers: { "content-type": "message/ohttp-res" } }));
+        if (!(await abortable(sourceAllowed(req), signal))) {
+          return reply("rate limited", 429, { "Retry-After": "60" });
+        }
+        const upstreamPath = scheduler ? path.slice("/scheduler".length) : path;
+        const upstreamURL = base + upstreamPath + query;
+        // Version + purpose + target isolate caches from old relay behavior and
+        // configuration changes. No unvalidated caller query reaches cache keys.
+        const cacheURL = new URL(req.url);
+        cacheURL.pathname = "/.relay-public-v2/" + (scheduler ? "scheduler/" : "paymaster/") + encodeURIComponent(upstreamURL);
+        cacheURL.search = "";
+        const cacheKey = new Request(cacheURL.toString(), { method: "GET" });
+        const cache = options.cache === undefined
+          ? (globalThis as typeof globalThis & { caches?: { default?: RelayCache } }).caches?.default
+          : options.cache;
+        const expectedType = gateway ? RESPONSE_TYPE : keyConfig ? CONFIG_TYPE : "application/json";
+        let upstream: Response | undefined;
+        if (!gateway && cache) {
+          try { upstream = await abortable(cache.match(cacheKey), signal); } catch { signal.throwIfAborted(); }
+        }
+        const cached = !!upstream;
+        if (!upstream) {
+          const headers = new Headers(STRIP_IP_HEADERS);
+          headers.set("Accept", expectedType);
+          headers.set("Accept-Encoding", "identity");
+          headers.set("User-Agent", "");
+          let body: Uint8Array | undefined;
+          if (gateway) {
+            try {
+              body = await readBounded(req.body, req.headers, requestLimit, signal, 413);
+            } catch (error) {
+              signal.throwIfAborted();
+              return fail(error instanceof RelayFailure ? error.status : 400, "invalid request body");
+            }
+            if (!body.length) return fail(400, "empty request body");
+            headers.set("Content-Type", REQUEST_TYPE);
+          }
+          upstream = await abortable(fetchUpstream(upstreamURL, {
+            method: gateway ? "POST" : "GET", headers, body: body as BodyInit | undefined,
+            redirect: "manual", credentials: "omit", signal,
+          }), signal);
+        }
+        if (!upstream.ok || upstream.status !== 200 || !contentType(upstream, expectedType)) {
+          void upstream.body?.cancel().catch(() => {});
+          return fail(502, "invalid gateway response");
+        }
+        const body = await readBounded(upstream.body, upstream.headers, MAX_BODY, signal, 502);
+        if (!body.length) return fail(502, "empty gateway response");
+        const headers: Record<string, string> = { "Content-Type": expectedType, "Cache-Control": "no-store" };
+        if (!gateway) headers["Cache-Control"] = publicCacheControl(upstream.headers) ?? "no-store";
+        const response = reply(body as BodyInit, 200, headers);
+        if (!gateway && !cached && cache && headers["Cache-Control"] !== "no-store") {
+          // Hold the buffer reservation while caching; unbounded background
+          // writes would bypass the isolate memory budget under load.
+          try { await abortable(cache.put(cacheKey, response.clone()), signal); } catch { signal.throwIfAborted(); }
+        }
+        return response;
       } catch {
-        return withCors(new Response("bad gateway", { status: 502 }));
+        return fail(signal.aborted ? 504 : 502, "gateway unavailable");
       } finally {
-        activeGatewayRequests -= 1;
+        clearTimeout(timer);
+        req.signal.removeEventListener("abort", abort);
+        activeRequests -= 1;
+        reservedBytes -= reservation;
       }
-    }
-    return withCors(new Response("not found", { status: 404 }));
-  },
-};
+    },
+  };
+}
+
+export default createRelayHandler();

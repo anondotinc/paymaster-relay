@@ -1,235 +1,375 @@
-// Package main implements a keyless Oblivious HTTP relay: it forwards
-// encapsulated requests to a fixed gateway and returns the encapsulated
-// response. It holds NO keys and sees NO plaintext — safe for any operator to
-// run.
+// Package main implements a keyless relay with fixed, purpose-specific gateways.
 package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const (
-	ctReq   = "message/ohttp-req"
-	ctRes   = "message/ohttp-res"
-	maxBody = 1 << 20 // 1 MiB
+	ctReq            = "message/ohttp-req"
+	ctRes            = "message/ohttp-res"
+	ctConfigs        = "application/ohttp-keys-signed"
+	maxBody          = 1 << 20
+	maxSchedulerBody = 4 << 20
+	upstreamTimeout  = 20 * time.Second
 )
 
-// The relay is a public, keyless service intended to be called directly by
-// third-party browser apps. It uses no cookies or other browser credentials,
-// so a wildcard origin is both sufficient and easier for integrators than an
-// origin allowlist.
+var publicReadPaths = []string{
+	"/api/v1/paymaster/gas-quote",
+	"/api/v1/paymaster/supported-tokens",
+}
+
+type relayRoute struct {
+	method       string
+	target       string
+	responseType string
+	requestLimit int64
+}
+
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Max-Age", "86400")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// publicReadPaths are the paymaster's public, cacheable, identity-free GET
-// endpoints the relay proxies so the client can fetch them WITHOUT exposing its
-// IP to the paymaster. They carry no client identity and are byte-identical per
-// (chain, priority, cache-window), so no HPKE sealing is needed — the relay
-// forwards path+query verbatim. Allowlisted so the relay is never an open proxy.
-var publicReadPaths = []string{
-	"/api/v1/paymaster/gas-quote",
-	"/api/v1/paymaster/supported-tokens",
+// New preserves the paymaster-only constructor and fails closed for invalid
+// configuration. Main uses NewWithScheduler for explicit startup errors.
+func New(gatewayURL string, client *http.Client) http.Handler {
+	var handler, err = NewWithScheduler(gatewayURL, "", client)
+	if err != nil {
+		return withCORS(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "relay unavailable", http.StatusServiceUnavailable)
+		}))
+	}
+	return handler
 }
 
-// New builds the relay's HTTP handler. It proxies the keyconfig fetch
-// (GET /ohttp-configs) and the public read endpoints (gas-quote, supported-tokens)
-// so the client can run the whole flow — quote, execute, status — through the
-// relay without ever contacting the paymaster directly, and forwards encapsulated
-// requests (POST /gateway) to the fixed gatewayURL, relaying back the encapsulated
-// response. Only encapsulated bodies / allowlisted public GETs cross the relay —
-// no client headers, no PII, no keys. Public GETs are cached per the paymaster's
-// Cache-Control TTL (shared across clients; see cache.go).
-func New(gatewayURL string, client *http.Client) http.Handler {
-	mux := http.NewServeMux()
-	cache := newTTLCache()
-	safeguards := newRelaySafeguards()
-
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
-
-	mux.HandleFunc("GET /ohttp-configs", func(w http.ResponseWriter, r *http.Request) {
-		proxyGet(client, cache, gatewayURL+"/ohttp-configs", w, r)
-	})
-
-	// Public read endpoints: forward path + query (no client headers, no PII),
-	// cached per the paymaster's Cache-Control TTL.
-	for _, p := range publicReadPaths {
-		path := p
-		mux.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
-			target := gatewayURL + r.URL.Path
-			if r.URL.RawQuery != "" {
-				target += "?" + r.URL.RawQuery
-			}
-			proxyGet(client, cache, target, w, r)
-		})
+// NewWithScheduler adds opt-in scheduler routes. Each base is fixed by the
+// operator; clients cannot select targets. Gateways retain their separate keys.
+func NewWithScheduler(gatewayURL, schedulerURL string, client *http.Client) (http.Handler, error) {
+	var err error
+	gatewayURL, err = validateGatewayURL(gatewayURL)
+	if err != nil {
+		return nil, err
 	}
-
-	// Public gas reads (gas tiers, network base fee): strictly validated and
-	// canonicalized before forwarding; see gas_reads.go.
-	handleGasReads(mux, client, cache, gatewayURL)
-
-	gateway := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var (
-			body []byte
-			req  *http.Request
-			resp *http.Response
-			err  error
-		)
-		if r.Header.Get("Content-Type") != ctReq {
-			http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
-		body, err = io.ReadAll(r.Body)
+	if schedulerURL != "" {
+		schedulerURL, err = validateGatewayURL(schedulerURL)
 		if err != nil {
-			if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
-				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			return nil, err
+		}
+		if schedulerURL == gatewayURL {
+			return nil, errors.New("scheduler requires a distinct gateway base")
+		}
+	}
+	var routes = map[string]relayRoute{
+		"/health":        {method: http.MethodGet},
+		"/ohttp-configs": {method: http.MethodGet, target: gatewayURL + "/ohttp-configs", responseType: ctConfigs},
+		"/gateway":       {method: http.MethodPost, target: gatewayURL + "/gateway", responseType: ctRes, requestLimit: maxBody},
+	}
+	for _, routePath := range publicReadPaths {
+		routes[routePath] = relayRoute{method: http.MethodGet, target: gatewayURL + routePath, responseType: "application/json"}
+	}
+	if schedulerURL != "" {
+		routes["/scheduler/ohttp-configs"] = relayRoute{method: http.MethodGet, target: schedulerURL + "/ohttp-configs", responseType: ctConfigs}
+		routes["/scheduler/gateway"] = relayRoute{method: http.MethodPost, target: schedulerURL + "/gateway", responseType: ctRes, requestLimit: maxSchedulerBody}
+	}
+	var cache = newTTLCache()
+	var safeguards = newRelaySafeguards()
+	client = relayHTTPClient(client)
+	// Public gas reads (gas tiers, gas history, network base fee): strictly
+	// validated and canonicalized before forwarding; see gas_reads.go. They keep
+	// their own mux and fresh-only proxy, and are not behind the sealed-route
+	// safeguards (identity-free, cached for seconds, canonical key space).
+	var gasReads = http.NewServeMux()
+	handleGasReads(gasReads, client, cache, gatewayURL)
+	return withCORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		if isGasReadPath(r.URL.Path) {
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
-			http.Error(w, "bad request", http.StatusBadRequest)
+			gasReads.ServeHTTP(w, r)
 			return
 		}
-		// Forward ONLY the encapsulated body + content-type. No client headers, no PII.
-		req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, gatewayURL+"/gateway", bytesReader(body))
-		if err != nil {
-			http.Error(w, "bad gateway", http.StatusBadGateway)
+		var route, exists = routes[r.URL.Path]
+		if !exists || r.URL.EscapedPath() != r.URL.Path {
+			http.NotFound(w, r)
 			return
 		}
-		req.Header.Set("Content-Type", ctReq)
-		// Suppress net/http's generic User-Agent too. It is not copied from the
-		// caller, but omitting it keeps gateway telemetry entirely free of a
-		// user-agent dimension and makes this allowlist exact.
-		req.Header.Set("User-Agent", "")
-		resp, err = client.Do(req)
-		if err != nil {
-			http.Error(w, "bad gateway", http.StatusBadGateway)
+		var query, queryErr = canonicalPublicQuery(r.URL.Path, r.URL.RawQuery)
+		if queryErr != nil {
+			http.Error(w, "invalid query", http.StatusBadRequest)
 			return
 		}
-		defer resp.Body.Close()
-		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
-		if readErr != nil || len(responseBody) > maxBody {
-			http.Error(w, "bad gateway", http.StatusBadGateway)
+		if r.Method == http.MethodOptions {
+			var requested = r.Header.Get("Access-Control-Request-Method")
+			if requested != "" && requested != route.method {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		w.Header().Set("Content-Type", ctRes)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(responseBody)
-	})
-	mux.Handle("POST /gateway", safeguards.gateway(gateway))
-
-	return withCORS(mux)
+		if r.Method != route.method {
+			w.Header().Set("Allow", route.method+", OPTIONS")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		var requestLimit = route.requestLimit
+		if requestLimit == 0 {
+			requestLimit = maxBody
+		}
+		safeguards.gatewayWithLimit(requestLimit, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if route.method == http.MethodGet {
+				if query != "" {
+					route.target += "?" + query
+				}
+				proxyGet(client, cache, route.target, route.responseType, w, r)
+				return
+			}
+			proxySealed(client, route, w, r)
+		})).ServeHTTP(w, r)
+	})), nil
 }
 
-// proxyGet forwards a GET to url and copies the upstream status, Content-Type,
-// and body back to w. Used for the keyconfig passthrough and the public read
-// endpoints so the client never connects to the gateway directly. Successful
-// (200) responses are cached for as long as the upstream Cache-Control: max-age
-// permits (cacheTTL); within that window the relay answers from cache without
-// touching the paymaster. Fresh (non-cached) responses stream through; cache
-// hits carry an Age header.
-func proxyGet(client *http.Client, cache *ttlCache, url string, w http.ResponseWriter, r *http.Request) {
-	if e, ok := cache.get(url); ok {
-		writeCached(w, e)
-		return
+func validateGatewayURL(raw string) (string, error) {
+	var target, err = url.Parse(raw)
+	if err != nil || target == nil || target.Hostname() == "" || target.User != nil || target.RawQuery != "" || target.ForceQuery || target.Fragment != "" || strings.Contains(raw, "#") || (target.Scheme != "http" && target.Scheme != "https") {
+		return "", errors.New("invalid gateway base URL")
 	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	if target.EscapedPath() != target.Path || strings.Contains(target.Path, "\\") {
+		return "", errors.New("invalid gateway base path")
+	}
+	target.Path = strings.TrimRight(target.Path, "/")
+	if target.Path != "" && path.Clean(target.Path) != target.Path {
+		return "", errors.New("invalid gateway base path")
+	}
+	return target.String(), nil
+}
+
+// Restrict protobuf GET fields and values so identifiers never become
+// upstream URLs or shared-cache keys. Accept both protobuf field spellings.
+func canonicalPublicQuery(routePath, raw string) (string, error) {
+	var invalid = errors.New("invalid query")
+	if routePath != publicReadPaths[0] && routePath != publicReadPaths[1] {
+		if raw != "" {
+			return "", invalid
+		}
+		return "", nil
+	}
+	if len(raw) > 128 {
+		return "", invalid
+	}
+	var values, err = url.ParseQuery(raw)
 	if err != nil {
-		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
+		return "", invalid
 	}
-	// proxyGet reconstructs an identity-free request. Explicitly suppress the
-	// default Go User-Agent so public quote/token telemetry has no user-agent
-	// field even though the caller's headers were already omitted.
-	req.Header.Set("User-Agent", "")
-	resp, err := client.Do(req)
-	if err != nil {
-		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-	ct := resp.Header.Get("Content-Type")
-	cc := resp.Header.Get("Cache-Control")
-	age, ageOK := upstreamAge(resp.Header.Get("Age"))
-	switch {
-	case resp.StatusCode != http.StatusOK:
-		// Never cache an error, here or downstream (CDN, browser): the next
-		// request must reach the paymaster again.
-		cc = "no-store"
-	case !ageOK:
-		// RFC 9111 §5.1: an invalid Age means the response must be treated as stale.
-		cc = "no-store"
-	default:
-		// Cache only 200s, and only for what is LEFT of the TTL the paymaster
-		// grants (cacheTTL returns ok=false for no-store/no-cache/private or a
-		// missing max-age). An upstream Age counts against it, so a response that
-		// already sat in an upstream cache is never kept past its freshness.
-		if ttl, ok := cacheTTL(cc); ok {
-			if age >= ttl {
-				cc = "no-store"
-				break
+	var chain string
+	var priority string
+	for key, items := range values {
+		if len(items) != 1 {
+			return "", invalid
+		}
+		switch key {
+		case "chainId", "chain_id":
+			if chain != "" {
+				return "", invalid
 			}
-			now := timeNow()
-			cache.put(url, cacheEntry{
-				status:      resp.StatusCode,
-				body:        body,
-				contentType: ct,
-				cacheCtl:    cc,
-				upstreamAge: age,
-				storedAt:    now,
-				expiresAt:   now.Add(ttl - age),
-			})
+			chain = items[0]
+			if chain != "1" && chain != "56" && chain != "137" && chain != "42161" {
+				return "", invalid
+			}
+		case "priority":
+			if routePath != publicReadPaths[0] {
+				return "", invalid
+			}
+			priority = strings.ToLower(items[0])
+			if priority != "" && priority != "slow" && priority != "normal" && priority != "fast" {
+				return "", invalid
+			}
+		default:
+			return "", invalid
 		}
 	}
-	if ct != "" {
-		w.Header().Set("Content-Type", ct)
+	if chain == "" {
+		return "", invalid
 	}
-	// Preserve cacheability so a CDN in front of the relay can cache the
-	// (public) keyconfig / gas-quote / supported-tokens responses too. Age is
-	// passed on with it, so a downstream cache cannot extend the freshness.
-	if cc != "" {
-		w.Header().Set("Cache-Control", cc)
+	var normalized = url.Values{"chainId": {chain}}
+	if priority != "" {
+		normalized.Set("priority", priority)
 	}
-	if age > 0 && cc != "no-store" {
-		w.Header().Set("Age", strconv.Itoa(int(age/time.Second)))
+	return normalized.Encode(), nil
+}
+
+func relayHTTPClient(original *http.Client) *http.Client {
+	var client http.Client
+	if original != nil {
+		client = *original
 	}
-	w.WriteHeader(resp.StatusCode)
+	client.Jar = nil
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if client.Timeout <= 0 || client.Timeout > upstreamTimeout {
+		client.Timeout = upstreamTimeout
+	}
+	return &client
+}
+
+func upstreamRequest(r *http.Request, method, target, accept string, body io.Reader) (*http.Request, context.CancelFunc, error) {
+	var ctx, cancel = context.WithTimeout(r.Context(), upstreamTimeout)
+	var request, err = http.NewRequestWithContext(ctx, method, target, body)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	request.Header.Set("User-Agent", "")
+	request.Header.Set("Accept-Encoding", "identity")
+	request.Header.Set("Accept", accept)
+	if method == http.MethodPost {
+		request.Header.Set("Content-Type", ctReq)
+	}
+	return request, cancel, nil
+}
+
+func readUpstream(response *http.Response, expectedType string) ([]byte, error) {
+	var contentType, _, err = mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil || contentType != expectedType || response.StatusCode != http.StatusOK || response.ContentLength > maxBody {
+		return nil, errors.New("invalid gateway response")
+	}
+	var encoding = response.Header.Get("Content-Encoding")
+	if encoding != "" && !strings.EqualFold(encoding, "identity") {
+		return nil, errors.New("unexpected gateway encoding")
+	}
+	var body []byte
+	body, err = io.ReadAll(io.LimitReader(response.Body, maxBody+1))
+	if err != nil || len(body) == 0 || len(body) > maxBody || (response.ContentLength >= 0 && int64(len(body)) != response.ContentLength) {
+		return nil, errors.New("invalid gateway response body")
+	}
+	return body, nil
+}
+
+func proxySealed(client *http.Client, route relayRoute, w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Content-Type") != ctReq {
+		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	var encoding = r.Header.Get("Content-Encoding")
+	if encoding != "" && !strings.EqualFold(encoding, "identity") {
+		http.Error(w, "unsupported content encoding", http.StatusUnsupportedMediaType)
+		return
+	}
+	var body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, route.requestLimit))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(body) == 0 || (r.ContentLength >= 0 && int64(len(body)) != r.ContentLength) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var request, cancel, requestErr = upstreamRequest(r, http.MethodPost, route.target, ctRes, bytes.NewReader(body))
+	if requestErr != nil {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	defer cancel()
+	var response *http.Response
+	response, err = client.Do(request)
+	if err != nil {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	defer response.Body.Close()
+	body, err = readUpstream(response, ctRes)
+	if err != nil {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", ctRes)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(response.StatusCode)
 	_, _ = w.Write(body)
 }
 
-// writeCached serves a cached entry, tagging it with an Age header (the
-// upstream Age plus seconds since it was stored) as an HTTP cache should.
-func writeCached(w http.ResponseWriter, e cacheEntry) {
-	if e.contentType != "" {
-		w.Header().Set("Content-Type", e.contentType)
+func proxyGet(client *http.Client, cache *ttlCache, target, responseType string, w http.ResponseWriter, r *http.Request) {
+	var cached, exists = cache.get(target)
+	if exists {
+		writeCached(w, cached)
+		return
 	}
-	if e.cacheCtl != "" {
-		w.Header().Set("Cache-Control", e.cacheCtl)
+	var request, cancel, err = upstreamRequest(r, http.MethodGet, target, responseType, nil)
+	if err != nil {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
 	}
-	age := timeNow().Sub(e.storedAt)
+	defer cancel()
+	var response *http.Response
+	response, err = client.Do(request)
+	if err != nil {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	defer response.Body.Close()
+	var body []byte
+	body, err = readUpstream(response, responseType)
+	if err != nil {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	var cacheControl = response.Header.Get("Cache-Control")
+	var ttl, cacheable = cacheTTL(cacheControl)
+	// upstreamAge (cache.go) parses the upstream Age; an invalid or exhausted
+	// Age means the response is stale and must not be cached.
+	var age, ageOK = upstreamAge(response.Header.Get("Age"))
+	if !ageOK || age >= ttl {
+		cacheable = false
+	} else {
+		ttl -= age
+	}
+	cacheControl = "no-store"
+	if cacheable && ttl > 0 && response.Header.Get("Vary") == "" {
+		cacheControl = "public, max-age=" + strconv.FormatInt(int64(ttl/time.Second), 10)
+		var now = timeNow()
+		cache.put(target, cacheEntry{status: response.StatusCode, body: body, contentType: responseType, cacheCtl: cacheControl, storedAt: now, expiresAt: now.Add(ttl)})
+	}
+	w.Header().Set("Content-Type", responseType)
+	w.Header().Set("Cache-Control", cacheControl)
+	w.WriteHeader(response.StatusCode)
+	_, _ = w.Write(body)
+}
+
+func writeCached(w http.ResponseWriter, entry cacheEntry) {
+	w.Header().Set("Content-Type", entry.contentType)
+	w.Header().Set("Cache-Control", entry.cacheCtl)
+	var age = int(timeNow().Sub(entry.storedAt).Seconds())
 	if age < 0 {
 		age = 0
 	}
-	w.Header().Set("Age", strconv.Itoa(int((e.upstreamAge+age)/time.Second)))
-	w.WriteHeader(e.status)
-	_, _ = w.Write(e.body)
+	w.Header().Set("Age", strconv.Itoa(age))
+	w.WriteHeader(entry.status)
+	_, _ = w.Write(entry.body)
 }
-
-// bytesReader wraps a byte slice as an io.Reader for the forwarded request body.
-func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
