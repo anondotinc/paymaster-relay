@@ -376,6 +376,16 @@ func TestCacheTTL(t *testing.T) {
 		{"public, s-maxage=96, max-age=96", 96 * time.Second, true},
 		{"public, s-maxage=30, max-age=10", 30 * time.Second, true},
 		{"s-maxage=0, max-age=60", 0, false},
+		// Fail closed on field-listed no-cache/private and on malformed,
+		// signed, quoted, repeated or out-of-range lifetimes.
+		{`private="set-cookie", max-age=60`, 0, false},
+		{"no-cache=x, max-age=60", 0, false},
+		{"s-maxage=abc, max-age=60", 0, false},
+		{"s-maxage, max-age=60", 0, false},
+		{"max-age=+5", 0, false},
+		{`max-age="5"`, 0, false},
+		{"max-age=5, max-age=10", 0, false},
+		{"max-age=99999999999999999999", 0, false},
 	}
 	for _, c := range cases {
 		got, ok := cacheTTL(c.cc)

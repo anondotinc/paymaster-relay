@@ -55,12 +55,21 @@ access to paymaster secrets.
   `chain_id`) and no other field; `gas-fee` takes no query and one path segment.
   Anything else is a `400` (`404` for other paths), never cached. The relay
   forwards only the canonical target (`?chainId=<id>` / `/<id>`), so no caller
-  query reaches the API or the cache key. API errors (`400` for a chain the
-  paymaster doesn't serve, `503` with no base fee) pass through as `no-store`.
+  query reaches the API or the cache key. Only `GET` is served (`OPTIONS`
+  preflights aside); `HEAD`, `POST` and other methods are a `405` without an
+  API call. API errors (`400` for a chain the paymaster doesn't serve, `503`
+  with no base fee) pass through as `no-store`. Anything ambiguous fails closed
+  as a `502 no-store`: a redirect (its `Location` is never relayed), a
+  transport error or the 20 s timeout, or a body over 1 MiB, truncated or cut
+  by a read error. Every answer carries `X-Content-Type-Options: nosniff`.
   The rules live in `gas_reads.go` / `gasReadTarget` (`worker/src/index.ts`);
-  change both together.
-  They are not behind the per-source sealed-route limits (identity-free, cached
-  for seconds) and keep their own fresh-only cache path.
+  change both together. `testdata/gas_read_vectors.json` holds the shared
+  cases and is run by both test suites.
+  They are not behind the sealed-route concurrency or buffer budget
+  (identity-free, cached for seconds) and keep their own fresh-only cache
+  path, with their own per-source bucket (240 per minute, cache hits
+  included). The Go relay coalesces concurrent misses for one canonical
+  target into a single API fetch.
 - `GET /ppoi/ohttp-configs` and `POST /ppoi/gateway` are available **only when
   `PPOI_TARGET` is set** (404 otherwise). They forward to
   `${PPOI_TARGET}/ohttp-configs` and `${PPOI_TARGET}/gateway` (production:
@@ -88,7 +97,8 @@ type and rejects truncated, oversized, or unexpectedly compressed responses.
 Gateway requests are limited to 1 MiB for paymaster and 4 MiB for scheduler;
 all responses remain limited to 1 MiB. GET and POST upstream work shares the
 bounded concurrency and per-route source-rate buckets (paymaster 60/min,
-scheduler 60/min, PPOI 180/min per hashed source, each independent). Sealed
+scheduler 60/min, PPOI 180/min per hashed source, each independent; the
+public gas reads have their own 240/min bucket). Sealed
 routes have a 40-second deadline (above the backend gateway ladder: handler
 25 s < forwarder 28 s < gateway 30-35 s < relay 40 s); public reads and key
 configs keep 20 seconds. Gateway
@@ -104,8 +114,11 @@ the paymaster's `Cache-Control`**:
   served from cache within that window (with an `Age` header). The relay never
   serves a response staler than the paymaster's own `max-age` — so a cached quote
   can't outlive the window the paymaster is willing to honor at execute time.
-- `no-store` / `no-cache` / `private`, or a missing / zero `max-age`, disable
-  caching for that response — the relay refetches every time.
+- `no-store` / `no-cache` / `private` (also with a field list, such as
+  `private="set-cookie"`), or a missing / zero `max-age`, disable caching for
+  that response — the relay refetches every time. So does a malformed,
+  signed, quoted, repeated or out-of-range `s-maxage`/`max-age`; a malformed
+  `s-maxage` never falls back to `max-age`.
 - Errors are never cached by the relay (only `200`s are stored).
 - The Go relay (every read) and the Worker's gas reads also count an upstream
   `Age` against that lifetime, so neither the relay nor a cache behind it
@@ -115,14 +128,21 @@ the paymaster's `Cache-Control`**:
   also reduces the request volume the paymaster sees.
 - Cache keys include the fixed target, separating scheduler and paymaster key
   configurations. Upstream `Age` reduces the remaining lifetime; malformed or
-  exhausted ages and `Vary` disable caching. Only rebuilt cache metadata and the
+  exhausted ages and `Vary` disable caching (for the gas reads only `Vary: *`
+  does: the relay sends the API the same headers for every caller, so other
+  `Vary` values are dropped). Only rebuilt cache metadata and the
   expected content type are returned, not cookies, redirects, or trace headers.
+- The gas reads answer `public, max-age=<seconds left>` (rounded down, no
+  `Age`) on a fetch and on every cache hit, in both implementations, so a cache
+  behind the relay never holds one past the API's lifetime.
 
 The **Go** relay uses a small in-memory TTL cache (`cache.go`); the **Worker**
 uses the Cloudflare edge cache (`caches.default`), which honors origin
 `Cache-Control` automatically. For the gas reads the Worker rebuilds the
 response headers and stores `public, max-age=<remaining>` (s-maxage or max-age
-minus `Age`), keyed by the canonical target. To set the TTL, set
+minus `Age`) with the time it stops being fresh, keyed by the canonical target;
+a hit re-derives the seconds left from that time instead of re-serving the
+stored `max-age`. To set the TTL, set
 `Cache-Control: max-age=…` on the paymaster's `gas-quote` / `supported-tokens`
 responses (≤ its quote validity window).
 

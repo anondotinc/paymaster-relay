@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -39,9 +43,9 @@ func gasRead(handler http.Handler, method, target string) *httptest.ResponseReco
 	return response
 }
 
-// TestGasReadsProxied asserts both gas reads reach the fixed API with only the
+// TestGasReadsProxied asserts the gas reads reach the fixed API with only the
 // canonical chain — no client header, cookie or extra query — and relay the
-// API's JSON, Cache-Control and CORS.
+// API's JSON with rebuilt Cache-Control, nosniff and CORS.
 func TestGasReadsProxied(t *testing.T) {
 	const fresh = "public, s-maxage=5, max-age=5"
 	var cases = []struct{ path, target, body string }{
@@ -70,7 +74,7 @@ func TestGasReadsProxied(t *testing.T) {
 			t.Errorf("%s: body %q", testCase.path, response.Body.String())
 		}
 		var header = response.Header()
-		if header.Get("Content-Type") != "application/json" || header.Get("Cache-Control") != fresh {
+		if header.Get("Content-Type") != "application/json" || header.Get("Cache-Control") != "public, max-age=5" || header.Get("X-Content-Type-Options") != "nosniff" {
 			t.Errorf("%s: headers %v", testCase.path, header)
 		}
 		if header.Get("Access-Control-Allow-Origin") != "*" || header.Get("Access-Control-Allow-Methods") != "GET, POST, OPTIONS" {
@@ -134,6 +138,10 @@ func TestGasReadsRejectInvalid(t *testing.T) {
 		{http.MethodGet, "/api/v1/paymaster/gas-tiers/1", 404},
 		{http.MethodPost, "/api/v1/paymaster/gas-tiers?chainId=1", 405},
 		{http.MethodPost, "/api/v1/tx/gas-fee/42161", 405},
+		{http.MethodHead, "/api/v1/paymaster/gas-history?chainId=1", 405},
+		{http.MethodHead, "/api/v1/tx/gas-fee/42161", 405},
+		{http.MethodPost, "/api/v1/tx/gas-fee/999", 405},
+		{http.MethodOptions, "/api/v1/tx/gas-fee/42161/extra", 404},
 	}
 	for _, testCase := range cases {
 		var response = gasRead(handler, testCase.method, testCase.path)
@@ -165,7 +173,8 @@ func TestCanonicalGasTiersQuery(t *testing.T) {
 
 // TestGasReadsFreshOnly asserts the relay caches a gas read only for what is
 // left of the API's freshness: never past s-maxage, never resetting an
-// upstream Age, and passing the Age on so a downstream cache cannot extend it.
+// upstream Age, and advertising only the remaining seconds (max-age, no Age)
+// so a downstream cache cannot extend it either.
 func TestGasReadsFreshOnly(t *testing.T) {
 	var realNow = timeNow
 	defer func() { timeNow = realNow }()
@@ -181,55 +190,31 @@ func TestGasReadsFreshOnly(t *testing.T) {
 	})}
 	var handler = New("https://api.test", client)
 	const path = "/api/v1/tx/gas-fee/42161"
-
-	// No upstream Age: cached for the full 5s, then refetched.
-	var response = gasRead(handler, http.MethodGet, path)
-	if calls != 1 || response.Header().Get("Age") != "" {
-		t.Fatalf("fresh fetch: calls %d, age %q", calls, response.Header().Get("Age"))
+	var expect = func(step string, wantCalls int, cacheControl string) {
+		t.Helper()
+		var response = gasRead(handler, http.MethodGet, path)
+		if calls != wantCalls || response.Code != http.StatusOK || response.Header().Get("Cache-Control") != cacheControl || response.Header().Get("Age") != "" {
+			t.Fatalf("%s: calls %d, status %d, headers %v", step, calls, response.Code, response.Header())
+		}
 	}
+
+	// No upstream Age: cached for the full 5s, each hit advertising what is left.
+	expect("fresh fetch", 1, "public, max-age=5")
 	now = base.Add(4 * time.Second)
-	response = gasRead(handler, http.MethodGet, path)
-	if calls != 1 || response.Header().Get("Age") != "4" || response.Header().Get("Cache-Control") != "public, s-maxage=5, max-age=5" {
-		t.Fatalf("cache hit: calls %d, headers %v", calls, response.Header())
-	}
+	expect("hit at 4s", 1, "public, max-age=1")
+	now = base.Add(4500 * time.Millisecond)
+	expect("hit under 1s left", 1, "no-store")
 	now = base.Add(5 * time.Second)
-	gasRead(handler, http.MethodGet, path)
-	if calls != 2 {
-		t.Fatalf("served past s-maxage: calls %d", calls)
-	}
+	expect("past s-maxage", 2, "public, max-age=5")
 
-	// Upstream Age 3: only 2s left, and the Age travels with the response.
+	// Upstream Age 3: only 2s left.
 	handler = New("https://api.test", client)
 	now, calls, age = base, 0, "3"
-	response = gasRead(handler, http.MethodGet, path)
-	if response.Header().Get("Age") != "3" {
-		t.Fatalf("fresh fetch dropped upstream Age: %v", response.Header())
-	}
+	expect("fresh fetch with Age", 1, "public, max-age=2")
 	now = base.Add(1 * time.Second)
-	response = gasRead(handler, http.MethodGet, path)
-	if calls != 1 || response.Header().Get("Age") != "4" {
-		t.Fatalf("cache hit reset upstream Age: calls %d, age %q", calls, response.Header().Get("Age"))
-	}
+	expect("hit with Age", 1, "public, max-age=1")
 	now = base.Add(2 * time.Second)
-	gasRead(handler, http.MethodGet, path)
-	if calls != 2 {
-		t.Fatalf("upstream Age extended freshness: calls %d", calls)
-	}
-
-	// Exhausted or invalid Age: stale, so neither cached nor cacheable.
-	for _, stale := range []string{"5", "60", "x", "-1", "+1", "1, 2"} {
-		handler = New("https://api.test", client)
-		now, calls, age = base, 0, stale
-		for i := 0; i < 2; i++ {
-			response = gasRead(handler, http.MethodGet, path)
-			if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Age") != "" {
-				t.Fatalf("Age %q: status %d, headers %v", stale, response.Code, response.Header())
-			}
-		}
-		if calls != 2 {
-			t.Fatalf("Age %q: stale response cached (calls %d)", stale, calls)
-		}
-	}
+	expect("upstream Age exhausted", 2, "public, max-age=2")
 }
 
 // TestGasReadsNeverCacheErrors asserts API errors (400 for a chain the
@@ -302,5 +287,233 @@ func TestUpstreamAge(t *testing.T) {
 		if got != testCase.want || ok != testCase.ok {
 			t.Errorf("upstreamAge(%q) = (%v,%v), want (%v,%v)", testCase.value, got, ok, testCase.want, testCase.ok)
 		}
+	}
+}
+
+// gasReadVectors is testdata/gas_read_vectors.json, shared with the Worker
+// tests (worker/test/gas-reads.test.mjs) so both implementations keep one rule set.
+type gasReadVectors struct {
+	Path    string `json:"path"`
+	Target  string `json:"target"`
+	MaxBody int    `json:"maxBody"`
+	Vectors []struct {
+		Name     string `json:"name"`
+		Method   string `json:"method"`
+		Upstream *struct {
+			Status        int               `json:"status"`
+			Headers       map[string]string `json:"headers"`
+			Body          *string           `json:"body"`
+			BodyBytes     int               `json:"bodyBytes"`
+			ContentLength *int64            `json:"contentLength"`
+			BodyError     bool              `json:"bodyError"`
+		} `json:"upstream"`
+		Expect struct {
+			Status        int     `json:"status"`
+			CacheControl  string  `json:"cacheControl"`
+			Body          *string `json:"body"`
+			BodyBytes     int     `json:"bodyBytes"`
+			Cached        bool    `json:"cached"`
+			Allow         string  `json:"allow"`
+			UpstreamCalls *int    `json:"upstreamCalls"`
+		} `json:"expect"`
+	} `json:"vectors"`
+}
+
+type failingBody struct{}
+
+func (failingBody) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+
+func TestGasReadVectors(t *testing.T) {
+	var raw, err = os.ReadFile("testdata/gas_read_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file gasReadVectors
+	if err = json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	if file.MaxBody != maxBody || len(file.Vectors) == 0 {
+		t.Fatalf("vector file: maxBody %d, %d vectors", file.MaxBody, len(file.Vectors))
+	}
+	// Both attempts happen at the same instant, so a hit advertises the full
+	// remaining freshness (TestGasReadsFreshOnly covers the clock moving).
+	var realNow = timeNow
+	defer func() { timeNow = realNow }()
+	var frozen = time.Unix(1_700_000_000, 0)
+	timeNow = func() time.Time { return frozen }
+	for _, vector := range file.Vectors {
+		var calls int
+		var client = &http.Client{Transport: gasRoundTripper(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if request.URL.String() != "https://api.test"+file.Target {
+				t.Errorf("%s: target %s", vector.Name, request.URL)
+			}
+			var upstream = vector.Upstream
+			if upstream == nil {
+				return gasUpstream(http.StatusOK, "public, s-maxage=5, max-age=5", "", "{}"), nil
+			}
+			var header = http.Header{"Content-Type": {"application/json"}, "Set-Cookie": {"upstream=secret"}, "X-Upstream-Trace": {"trace"}}
+			for name, value := range upstream.Headers {
+				header.Set(name, value)
+			}
+			var body = strings.Repeat("x", upstream.BodyBytes)
+			if upstream.Body != nil {
+				body = *upstream.Body
+			}
+			var reader io.Reader = strings.NewReader(body)
+			var length = int64(len(body))
+			if upstream.ContentLength != nil {
+				length = *upstream.ContentLength
+			}
+			if upstream.BodyError {
+				reader, length = io.MultiReader(reader, failingBody{}), -1
+			}
+			return &http.Response{StatusCode: upstream.Status, Header: header, Body: io.NopCloser(reader), ContentLength: length}, nil
+		})}
+		var handler = New("https://api.test", client)
+		var method = vector.Method
+		if method == "" {
+			method = http.MethodGet
+		}
+		for attempt := 1; attempt <= 2; attempt++ {
+			var response = gasRead(handler, method, file.Path)
+			var header = response.Header()
+			if response.Code != vector.Expect.Status || header.Get("Cache-Control") != vector.Expect.CacheControl {
+				t.Errorf("%s (#%d): status %d, Cache-Control %q", vector.Name, attempt, response.Code, header.Get("Cache-Control"))
+			}
+			if header.Get("X-Content-Type-Options") != "nosniff" || header.Get("Access-Control-Allow-Origin") != "*" {
+				t.Errorf("%s (#%d): headers %v", vector.Name, attempt, header)
+			}
+			for _, name := range []string{"Location", "Set-Cookie", "Vary", "Age", "X-Upstream-Trace"} {
+				if header.Get(name) != "" {
+					t.Errorf("%s (#%d): %s relayed", vector.Name, attempt, name)
+				}
+			}
+			if vector.Expect.Allow != "" && header.Get("Allow") != vector.Expect.Allow {
+				t.Errorf("%s (#%d): Allow %q", vector.Name, attempt, header.Get("Allow"))
+			}
+			if vector.Expect.Body != nil && response.Body.String() != *vector.Expect.Body {
+				t.Errorf("%s (#%d): body %q", vector.Name, attempt, response.Body.String())
+			}
+			if vector.Expect.BodyBytes > 0 && response.Body.Len() != vector.Expect.BodyBytes {
+				t.Errorf("%s (#%d): body length %d", vector.Name, attempt, response.Body.Len())
+			}
+		}
+		var wantCalls = 2
+		switch {
+		case vector.Expect.UpstreamCalls != nil:
+			wantCalls = *vector.Expect.UpstreamCalls
+		case vector.Expect.Cached:
+			wantCalls = 1
+		}
+		if calls != wantCalls {
+			t.Errorf("%s: %d upstream calls, want %d", vector.Name, calls, wantCalls)
+		}
+	}
+}
+
+// TestGasReadsCoalesce asserts concurrent misses for one canonical target
+// share a single upstream fetch, even when its answer is not cacheable.
+func TestGasReadsCoalesce(t *testing.T) {
+	// blockingClient answers every fetch only once release is closed.
+	var blockingClient = func(calls *atomic.Int32, entered, release chan struct{}) *http.Client {
+		return &http.Client{Transport: gasRoundTripper(func(*http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				close(entered)
+			}
+			<-release
+			return gasUpstream(http.StatusOK, "no-store", "", `{"chainId":"1"}`), nil
+		})}
+	}
+	var calls atomic.Int32
+	var entered, release = make(chan struct{}), make(chan struct{})
+	var reads = newGasReader(blockingClient(&calls, entered, release), newTTLCache(), newRelaySafeguards())
+	const target = "https://api.test/api/v1/tx/gas-fee/1"
+	var flight = reads.join(target)
+	<-entered
+	for i := 0; i < 20; i++ {
+		if reads.join(target) != flight {
+			t.Fatal("a concurrent miss started a second fetch")
+		}
+	}
+	var other = reads.join("https://api.test/api/v1/tx/gas-fee/56")
+	if other == flight {
+		t.Fatal("different targets were coalesced")
+	}
+	close(release)
+	<-flight.done
+	<-other.done
+	if flight.result.failed || flight.result.status != http.StatusOK || string(flight.result.body) != `{"chainId":"1"}` || flight.result.maxAge != 0 {
+		t.Fatalf("shared result %+v", flight.result)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls %d, want 2 (one per target)", calls.Load())
+	}
+
+	// Through the handler: every waiter gets the one shared answer.
+	var handlerCalls atomic.Int32
+	var handlerEntered, handlerRelease = make(chan struct{}), make(chan struct{})
+	var handler = New("https://api.test", blockingClient(&handlerCalls, handlerEntered, handlerRelease))
+	var group sync.WaitGroup
+	var responses = make([]*httptest.ResponseRecorder, 10)
+	for i := range responses {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			responses[i] = gasRead(handler, http.MethodGet, "/api/v1/tx/gas-fee/1")
+		}()
+	}
+	<-handlerEntered
+	time.Sleep(20 * time.Millisecond)
+	close(handlerRelease)
+	group.Wait()
+	for _, response := range responses {
+		if response.Code != http.StatusOK || response.Body.String() != `{"chainId":"1"}` || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("waiter: %d %v %q", response.Code, response.Header(), response.Body.String())
+		}
+	}
+	if handlerCalls.Load() < 1 || handlerCalls.Load() > int32(len(responses)) {
+		t.Fatalf("upstream calls %d", handlerCalls.Load())
+	}
+}
+
+// TestGasReadsSourceBucket asserts the gas reads have their own per-source
+// budget: it trips after maxGasReadsPerMinute (cache hits included), does not
+// affect another source, and never consumes the paymaster's sealed budget.
+func TestGasReadsSourceBucket(t *testing.T) {
+	var calls int
+	var client = &http.Client{Transport: gasRoundTripper(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if request.URL.Path == "/gateway" {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {ctRes}}, Body: io.NopCloser(strings.NewReader("sealed")), ContentLength: 6}, nil
+		}
+		return gasUpstream(http.StatusOK, "public, s-maxage=5, max-age=5", "", "{}"), nil
+	})}
+	var handler = New("https://api.test", client)
+	for i := 0; i < maxGasReadsPerMinute; i++ {
+		if response := gasRead(handler, http.MethodGet, "/api/v1/tx/gas-fee/1"); response.Code != http.StatusOK {
+			t.Fatalf("read %d: %d", i+1, response.Code)
+		}
+	}
+	var limited = gasRead(handler, http.MethodGet, "/api/v1/paymaster/gas-tiers?chainId=1")
+	if limited.Code != http.StatusTooManyRequests || limited.Header().Get("Retry-After") != "60" || limited.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("over budget: %d %v", limited.Code, limited.Header())
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls %d, want 1 (the rest are cache hits)", calls)
+	}
+	var other = httptest.NewRequest(http.MethodGet, "/api/v1/tx/gas-fee/1", nil)
+	other.RemoteAddr = "198.51.100.7:1234"
+	var response = httptest.NewRecorder()
+	handler.ServeHTTP(response, other)
+	if response.Code != http.StatusOK {
+		t.Fatalf("other source: %d", response.Code)
+	}
+	var sealed = httptest.NewRequest(http.MethodPost, "/gateway", strings.NewReader("sealed"))
+	sealed.Header.Set("Content-Type", ctReq)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, sealed)
+	if response.Code != http.StatusOK {
+		t.Fatalf("sealed request after gas budget: %d", response.Code)
 	}
 }

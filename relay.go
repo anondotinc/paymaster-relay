@@ -120,19 +120,17 @@ func NewWithTargets(gatewayURL, schedulerURL, ppoiURL string, client *http.Clien
 	client = relayHTTPClient(client)
 	// Public gas reads (gas tiers, gas history, network base fee): strictly
 	// validated and canonicalized before forwarding; see gas_reads.go. They keep
-	// their own mux and fresh-only proxy, and are not behind the sealed-route
-	// safeguards (identity-free, cached for seconds, canonical key space).
+	// their own mux, fresh-only cache path, per-source bucket and coalescing,
+	// and are not behind the sealed-route concurrency (identity-free, cached for
+	// seconds, canonical key space: at most one fetch per target in flight).
 	var gasReads = http.NewServeMux()
 	var gasClient = *client
 	gasClient.Timeout = upstreamTimeout
-	handleGasReads(gasReads, &gasClient, cache, gatewayURL)
+	handleGasReads(gasReads, newGasReader(&gasClient, cache, safeguards), gatewayURL)
 	return withCORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		if isGasReadPath(r.URL.Path) {
-			if r.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
+			w.Header().Set("X-Content-Type-Options", "nosniff")
 			gasReads.ServeHTTP(w, r)
 			return
 		}

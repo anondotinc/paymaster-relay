@@ -18,6 +18,11 @@ const (
 	// 50-commitment batches in flight and must not starve (or be starved by)
 	// paymaster status polling, so it has its own, larger bucket.
 	maxPPOIRequestsPerMinute = 180
+	// maxGasReadsPerMinute is the public gas-read budget. The SDK refreshes each
+	// chain's reads every 10-30 s (under 100/min for a wallet on all four
+	// chains), so several wallets behind one address fit, while a single source
+	// is held to 4 reads/s. Cache hits count too.
+	maxGasReadsPerMinute = 240
 )
 
 // Named per-source rate-limit buckets. Each route belongs to exactly one, so
@@ -26,12 +31,14 @@ const (
 	bucketPaymaster = "paymaster"
 	bucketScheduler = "scheduler"
 	bucketPPOI      = "ppoi"
+	bucketGas       = "gas"
 )
 
 var bucketLimits = map[string]int{
 	bucketPaymaster: maxSourceRequestsPerMinute,
 	bucketScheduler: maxSourceRequestsPerMinute,
 	bucketPPOI:      maxPPOIRequestsPerMinute,
+	bucketGas:       maxGasReadsPerMinute,
 }
 
 // gatewayRequestTimeout is the outer deadline of a relayed request. It is the

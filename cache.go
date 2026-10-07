@@ -23,7 +23,6 @@ type cacheEntry struct {
 	body        []byte
 	contentType string
 	cacheCtl    string
-	upstreamAge time.Duration // the paymaster response's Age when stored
 	storedAt    time.Time
 	expiresAt   time.Time
 }
@@ -65,34 +64,30 @@ func (c *ttlCache) put(key string, e cacheEntry) {
 
 // cacheTTL parses Cache-Control and returns how long to cache the response.
 // It returns ok=false when the response must not be cached — no-store / no-cache
-// / private, or a missing / non-positive freshness lifetime — so the relay's
-// caching mirrors exactly what the paymaster permits. The relay is a SHARED
-// cache, so it honors s-maxage in preference to max-age when both are present
-// (RFC 9111 §5.2.2.10); the paymaster currently sets them equal.
+// / private (with or without a field list, e.g. private="set-cookie"), or a
+// missing, malformed, repeated or non-positive freshness lifetime — so the
+// relay's caching mirrors exactly what the paymaster permits and fails closed
+// on anything ambiguous. The relay is a SHARED cache, so it honors s-maxage in
+// preference to max-age (RFC 9111 §5.2.2.10); a malformed s-maxage never falls
+// back to max-age. The paymaster currently sets them equal.
 func cacheTTL(cacheControl string) (time.Duration, bool) {
-	if cacheControl == "" {
-		return 0, false
-	}
-	dirs := strings.Split(strings.ToLower(cacheControl), ",")
-	for _, d := range dirs {
-		switch strings.TrimSpace(d) {
+	var maxAge, sMaxAge = -1, -1
+	for _, directive := range strings.Split(strings.ToLower(cacheControl), ",") {
+		var name, value, hasValue = strings.Cut(strings.TrimSpace(directive), "=")
+		name = strings.TrimSpace(name)
+		switch name {
 		case "no-store", "no-cache", "private":
 			return 0, false
-		}
-	}
-	var maxAge, sMaxAge = -1, -1
-	for _, d := range dirs {
-		d = strings.TrimSpace(d)
-		if v, ok := strings.CutPrefix(d, "s-maxage="); ok {
-			if n, err := strconv.Atoi(v); err == nil {
-				sMaxAge = n
+		case "s-maxage", "max-age":
+			var seconds, ok = deltaSeconds(value)
+			var lifetime = &maxAge
+			if name == "s-maxage" {
+				lifetime = &sMaxAge
 			}
-			continue
-		}
-		if v, ok := strings.CutPrefix(d, "max-age="); ok {
-			if n, err := strconv.Atoi(v); err == nil {
-				maxAge = n
+			if !hasValue || !ok || *lifetime >= 0 {
+				return 0, false
 			}
+			*lifetime = seconds
 		}
 	}
 	// s-maxage wins for a shared cache; fall back to max-age.
@@ -106,6 +101,19 @@ func cacheTTL(cacheControl string) (time.Duration, bool) {
 	return 0, false
 }
 
+// deltaSeconds parses a delta-seconds value (RFC 9111 §1.2.2): plain digits
+// only (no sign, quotes or spaces), at most maxCacheAge.
+func deltaSeconds(value string) (int, bool) {
+	if value == "" || strings.TrimLeft(value, "0123456789") != "" {
+		return 0, false
+	}
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || seconds > int64(maxCacheAge/time.Second) {
+		return 0, false
+	}
+	return int(seconds), true
+}
+
 // upstreamAge parses an upstream Age header (RFC 9111 §5.1). An absent header
 // is age zero; a present but invalid one returns ok=false, and the response
 // must then be treated as stale.
@@ -113,11 +121,8 @@ func upstreamAge(value string) (time.Duration, bool) {
 	if value == "" {
 		return 0, true
 	}
-	if strings.TrimLeft(value, "0123456789") != "" {
-		return 0, false // not a plain non-negative integer ("+5", "-1", "5, 6")
-	}
-	seconds, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || seconds > int64(maxCacheAge/time.Second) {
+	seconds, ok := deltaSeconds(value) // rejects "+5", "-1", "5, 6"
+	if !ok {
 		return 0, false
 	}
 	return time.Duration(seconds) * time.Second, true
