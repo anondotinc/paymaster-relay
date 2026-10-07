@@ -108,9 +108,14 @@ relay does not use cookies or browser credentials.
   A request reserves, from its own route's caps, `2 x request cap` (sealed
   upload only: received chunks plus the concatenated copy handed to `fetch`)
   plus `3 x response cap` (chunks, concatenated copy, and the Response/cache
-  clone built from it). Paymaster 5 MiB (6 concurrent sealed requests per
-  isolate), scheduler 11 MiB (2), PPOI 896 KiB (36). The budget is shared by
-  every caller routed to the isolate. POI sync runs 3 concurrent batches per
+  clone built from it): paymaster 5 MiB, scheduler 11 MiB, PPOI 896 KiB per
+  sealed request. The budget is shared by every caller routed to the isolate,
+  but each route family has a ceiling so one cannot starve the others: PPOI
+  may hold at most 16 MiB (18 concurrent sealed requests per isolate), PPOI
+  and scheduler together at most 22 MiB (2 scheduler requests), so at least
+  10 MiB (2 sealed paymaster requests) always stays free for the paymaster,
+  which may use the whole pool (6). Slow PPOI uploads therefore cannot turn
+  `/gateway` into `503 relay busy`. POI sync runs 3 concurrent batches per
   client and the mobile app fires ~8 sealed requests at startup; both fit.
   Process-local, salted per-source buckets are kept per route: paymaster 60,
   scheduler 60 and PPOI 180 requests per minute, so PPOI sync cannot starve

@@ -64,6 +64,17 @@ export function bufferReservation(bucket: Bucket, gateway: boolean): number {
   const { request, response } = ROUTE_LIMITS[bucket];
   return (gateway ? 2 * request : 0) + 3 * response;
 }
+// Per-bucket shares of MAX_BUFFERED_WORK, so one route family (or one source
+// parking slow uploads in it) cannot answer "relay busy" for the others. PPOI
+// may hold at most half the pool (18 sealed requests); PPOI and scheduler
+// together never reach the last 10 MiB, which stays free for the paymaster
+// (two 5 MiB sealed /gateway requests). The paymaster may use the whole pool.
+export const PAYMASTER_BUFFER_FLOOR = 10 << 20;
+export const BUFFER_CEILINGS: Record<Bucket, number> = {
+  paymaster: MAX_BUFFERED_WORK,
+  scheduler: MAX_BUFFERED_WORK - PAYMASTER_BUFFER_FLOOR,
+  ppoi: MAX_BUFFERED_WORK / 2,
+};
 // Sealed routes nest above the backend gateway ladder (handler 25 s < forwarder
 // 28 s < gateway 30-35 s < relay 40 s); public reads and key configs keep 20 s.
 const SEALED_TIMEOUT_MS = 40_000;
@@ -305,6 +316,15 @@ export function createRelayHandler(options: RelayOptions = {}) {
   const fetchUpstream = options.fetch ?? ((...args: Parameters<typeof fetch>) => globalThis.fetch(...args));
   let activeRequests = 0;
   let reservedBytes = 0;
+  const reservedBy: Record<Bucket, number> = { paymaster: 0, scheduler: 0, ppoi: 0 };
+
+  /** Whether the pool, the bucket's ceiling and the paymaster floor all admit a reservation. */
+  function bufferAvailable(bucket: Bucket, reservation: number): boolean {
+    if (reservedBytes + reservation > MAX_BUFFERED_WORK) return false;
+    if (reservedBy[bucket] + reservation > BUFFER_CEILINGS[bucket]) return false;
+    return bucket === "paymaster" ||
+      reservedBytes - reservedBy.paymaster + reservation <= MAX_BUFFERED_WORK - PAYMASTER_BUFFER_FLOOR;
+  }
 
   async function sourceAllowed(req: Request, bucket: Bucket): Promise<boolean> {
     const salt = isolateSalt();
@@ -408,11 +428,12 @@ export function createRelayHandler(options: RelayOptions = {}) {
       const { request: requestLimit, response: responseLimit } = ROUTE_LIMITS[bucket];
       const reservation = bufferReservation(bucket, gateway);
       if (activeRequests >= (options.maxConcurrency ?? MAX_CONCURRENCY) ||
-          reservedBytes + reservation > MAX_BUFFERED_WORK) return fail(503, "relay busy");
+          !bufferAvailable(bucket, reservation)) return fail(503, "relay busy");
 
       // Reserve before any awaits/body reads so slow uploads cannot evade the cap.
       activeRequests += 1;
       reservedBytes += reservation;
+      reservedBy[bucket] += reservation;
       const controller = new AbortController();
       const abort = () => controller.abort(req.signal.reason);
       req.signal.addEventListener("abort", abort, { once: true });
@@ -483,6 +504,7 @@ export function createRelayHandler(options: RelayOptions = {}) {
         req.signal.removeEventListener("abort", abort);
         activeRequests -= 1;
         reservedBytes -= reservation;
+        reservedBy[bucket] -= reservation;
       }
     },
   };
