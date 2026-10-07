@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MAX_BUFFERED_WORK, ROUTE_LIMITS, bufferReservation, createRelayHandler } from "../src/index.ts";
+import { BUFFER_CEILINGS, MAX_BUFFERED_WORK, PAYMASTER_BUFFER_FLOOR, ROUTE_LIMITS, bufferReservation, createRelayHandler } from "../src/index.ts";
 
 const CONFIG_TYPE = "application/ohttp-keys-signed";
 const REQUEST_TYPE = "message/ohttp-req";
@@ -175,7 +175,7 @@ function slowFixture(options = {}) {
 }
 
 test("reservation per request and the resulting per-isolate capacity", () => {
-  const capacity = (bucket, gateway) => Math.floor(MAX_BUFFERED_WORK / bufferReservation(bucket, gateway));
+  const capacity = (bucket, gateway) => Math.floor(BUFFER_CEILINGS[bucket] / bufferReservation(bucket, gateway));
   // Paymaster and scheduler are unchanged: 2 * request + 3 * response.
   assert.equal(bufferReservation("paymaster", true), 5 * MiB);
   assert.equal(bufferReservation("scheduler", true), 11 * MiB);
@@ -186,22 +186,27 @@ test("reservation per request and the resulting per-isolate capacity", () => {
   assert.deepEqual(ROUTE_LIMITS.ppoi, { request: 64 * KiB, response: 256 * KiB });
   assert.equal(bufferReservation("ppoi", true), 896 * KiB);
   assert.equal(bufferReservation("ppoi", false), 768 * KiB);
-  assert.equal(capacity("ppoi", true), 36);
-  assert.ok(capacity("ppoi", true) >= 32);
+  // PPOI may hold half the pool: 18 sealed requests (21 key-config reads).
+  assert.equal(BUFFER_CEILINGS.ppoi, 16 * MiB);
+  assert.equal(capacity("ppoi", true), 18);
+  assert.equal(capacity("ppoi", false), 21);
+  // PPOI and scheduler together leave 10 MiB, two sealed paymaster requests.
+  assert.equal(PAYMASTER_BUFFER_FLOOR, 10 * MiB);
+  assert.equal(Math.floor(PAYMASTER_BUFFER_FLOOR / bufferReservation("paymaster", true)), 2);
   // The 2x / 3x multipliers still apply, and nothing grew.
   assert.equal(MAX_BUFFERED_WORK, 32 * MiB);
   assert.equal(ROUTE_LIMITS.scheduler.request, 4 * MiB);
 });
 
-test("32+ concurrent sealed ppoi requests with slow upstreams are all admitted; the budget still trips beyond it", async () => {
-  const capacity = Math.floor(MAX_BUFFERED_WORK / bufferReservation("ppoi", true));
+test("concurrent sealed ppoi requests with slow upstreams are admitted up to the ppoi ceiling; the budget trips beyond it", async () => {
+  const capacity = Math.floor(BUFFER_CEILINGS.ppoi / bufferReservation("ppoi", true));
   const { send, calls, releases } = slowFixture();
   // Incident shape first: 8 concurrent sealed POSTs from one client.
   // (One source stays well inside the 180/min ppoi bucket.)
   const inflight = [];
   for (let i = 0; i < capacity; i += 1) inflight.push(send(post("/ppoi/gateway")));
   await pending(calls, capacity);
-  assert.ok(calls.length >= 32, `only ${calls.length} admitted`);
+  assert.ok(calls.length >= 18, `only ${calls.length} admitted`);
   // Every admitted request is in flight at the gateway; the next one is the first refused.
   const refused = await send(post("/ppoi/gateway", "192.0.2.77"));
   assert.equal(refused.status, 503);
@@ -217,13 +222,37 @@ test("32+ concurrent sealed ppoi requests with slow upstreams are all admitted; 
 });
 
 test("slow ppoi uploads hold their reservation, so they cannot evade the cap", async () => {
-  const capacity = Math.floor(MAX_BUFFERED_WORK / bufferReservation("ppoi", true));
+  const capacity = Math.floor(BUFFER_CEILINGS.ppoi / bufferReservation("ppoi", true));
   const { send, calls } = slowFixture({ timeoutMs: 60 });
   const stalled = () => sealedBody("/ppoi/gateway", new ReadableStream());
   const uploads = Array.from({ length: capacity }, () => send(stalled()));
   assert.equal((await send(post("/ppoi/gateway", "192.0.2.9"))).status, 503);
   for (const result of await Promise.all(uploads)) assert.equal(result.status, 504);
   assert.equal(calls.length, 0);
+});
+
+test("a saturated ppoi bucket still admits paymaster POSTs, but not more ppoi or scheduler work", async () => {
+  const capacity = Math.floor(BUFFER_CEILINGS.ppoi / bufferReservation("ppoi", true));
+  const { send, calls } = fixture({ timeoutMs: 200 });
+  // One source parks slow uploads until the ppoi ceiling is full.
+  const stalled = () => sealedBody("/ppoi/gateway", new ReadableStream());
+  const uploads = Array.from({ length: capacity }, () => send(stalled()));
+  const refused = await send(post("/ppoi/gateway", "192.0.2.9"));
+  assert.equal(refused.status, 503);
+  assert.equal(await refused.text(), "relay busy");
+  // The scheduler shares the non-paymaster share, which ppoi has used up.
+  assert.equal((await send(post("/scheduler/gateway", "192.0.2.9"))).status, 503);
+  // The paymaster keeps at least its 10 MiB floor: two slow sealed uploads
+  // are admitted (they time out, 504, rather than being refused, 503) ...
+  const paymasterUploads = [send(sealedBody("/gateway", new ReadableStream())), send(sealedBody("/gateway", new ReadableStream()))];
+  // ... and a normal paymaster POST still reaches the gateway.
+  assert.equal((await send(post("/gateway", "192.0.2.9"))).status, 200);
+  assert.equal(calls.at(-1).url, "https://paymaster.invalid/gateway");
+  for (const result of await Promise.all(paymasterUploads)) assert.equal(result.status, 504);
+  for (const result of await Promise.all(uploads)) assert.equal(result.status, 504);
+  assert.equal(calls.length, 1);
+  // Everything is released afterwards.
+  assert.equal((await send(post("/ppoi/gateway", "192.0.2.9"))).status, 200);
 });
 
 test("ppoi bodies above the route caps fail cleanly; bodies at the cap pass", async () => {

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -83,125 +85,207 @@ func rejectGasRead(w http.ResponseWriter) {
 	http.Error(w, "invalid gas read", http.StatusBadRequest)
 }
 
-// handleGasReads registers the two gas reads on mux. Each forwards only the
-// canonical target through proxyGasGet, which honours (never extends) the API's
-// Cache-Control and never caches an error.
-func handleGasReads(mux *http.ServeMux, client *http.Client, cache *ttlCache, gatewayURL string) {
+// gasReadMethod answers preflights and refuses every method but GET (HEAD
+// included) before validation, so only a GET can reach the cache or the API.
+func gasReadMethod(w http.ResponseWriter, r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet:
+		return true
+	case http.MethodOptions:
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, OPTIONS")
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+	return false
+}
+
+// handleGasReads registers the gas reads on mux. Each forwards only the
+// canonical target through reads.serve, which honours (never extends) the
+// API's Cache-Control and never caches an error.
+func handleGasReads(mux *http.ServeMux, reads *gasReader, gatewayURL string) {
 	for _, path := range []string{gasTiersPath, gasHistoryPath} {
 		var path = path
-		mux.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			if !gasReadMethod(w, r) {
+				return
+			}
 			var query, ok = canonicalGasTiersQuery(r.URL.RawQuery)
 			if !ok {
 				rejectGasRead(w)
 				return
 			}
-			proxyGasGet(client, cache, gatewayURL+path+"?"+query, w, r)
+			reads.serve(gatewayURL+path+"?"+query, w, r)
 		})
 	}
-	mux.HandleFunc("GET "+gasFeePrefix+"{chainId}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(gasFeePrefix+"{chainId}", func(w http.ResponseWriter, r *http.Request) {
+		if !gasReadMethod(w, r) {
+			return
+		}
 		var chain, ok = gasFeeChain(r)
 		if !ok {
 			rejectGasRead(w)
 			return
 		}
-		proxyGasGet(client, cache, gatewayURL+gasFeePrefix+chain, w, r)
+		reads.serve(gatewayURL+gasFeePrefix+chain, w, r)
 	})
 }
 
-// proxyGasGet forwards a GET to url and copies the upstream status, Content-Type,
-// and body back to w. Used for the gas reads, which (unlike the other public reads) relay API
-// errors through uncached and honour an upstream Age; see gas_reads_test.go.
-// The other public reads use the stricter proxyGet in relay.go. Successful
-// (200) responses are cached for as long as the upstream Cache-Control: max-age
-// permits (cacheTTL); within that window the relay answers from cache without
-// touching the paymaster. Fresh (non-cached) responses stream through; cache
-// hits carry an Age header.
-func proxyGasGet(client *http.Client, cache *ttlCache, url string, w http.ResponseWriter, r *http.Request) {
-	if e, ok := cache.get(url); ok {
-		writeGasCached(w, e)
-		return
-	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
-	if err != nil {
-		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-	// proxyGasGet reconstructs an identity-free request. Explicitly suppress the
-	// default Go User-Agent so public quote/token telemetry has no user-agent
-	// field even though the caller's headers were already omitted.
-	req.Header.Set("User-Agent", "")
-	resp, err := client.Do(req)
-	if err != nil {
-		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-	ct := resp.Header.Get("Content-Type")
-	cc := resp.Header.Get("Cache-Control")
-	age, ageOK := upstreamAge(resp.Header.Get("Age"))
-	switch {
-	case resp.StatusCode != http.StatusOK:
-		// Never cache an error, here or downstream (CDN, browser): the next
-		// request must reach the paymaster again.
-		cc = "no-store"
-	case !ageOK:
-		// RFC 9111 §5.1: an invalid Age means the response must be treated as stale.
-		cc = "no-store"
-	default:
-		// Cache only 200s, and only for what is LEFT of the TTL the paymaster
-		// grants (cacheTTL returns ok=false for no-store/no-cache/private or a
-		// missing max-age). An upstream Age counts against it, so a response that
-		// already sat in an upstream cache is never kept past its freshness.
-		if ttl, ok := cacheTTL(cc); ok {
-			if age >= ttl {
-				cc = "no-store"
-				break
-			}
-			now := timeNow()
-			cache.put(url, cacheEntry{
-				status:      resp.StatusCode,
-				body:        body,
-				contentType: ct,
-				cacheCtl:    cc,
-				upstreamAge: age,
-				storedAt:    now,
-				expiresAt:   now.Add(ttl - age),
-			})
-		}
-	}
-	if ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	// Preserve cacheability so a CDN in front of the relay can cache the
-	// (public) keyconfig / gas-quote / supported-tokens responses too. Age is
-	// passed on with it, so a downstream cache cannot extend the freshness.
-	if cc != "" {
-		w.Header().Set("Cache-Control", cc)
-	}
-	if age > 0 && cc != "no-store" {
-		w.Header().Set("Age", strconv.Itoa(int(age/time.Second)))
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
+// gasReader serves the gas reads: a per-source bucket, the shared TTL cache,
+// and singleflight-style coalescing, so concurrent misses for one canonical
+// target cost the API a single fetch (the key space is 12 targets).
+type gasReader struct {
+	client     *http.Client
+	cache      *ttlCache
+	safeguards *relaySafeguards
+	mu         sync.Mutex
+	flights    map[string]*gasFlight
 }
 
-// writeGasCached serves a cached entry, tagging it with an Age header (the
-// upstream Age plus seconds since it was stored) as an HTTP cache should.
-func writeGasCached(w http.ResponseWriter, e cacheEntry) {
-	if e.contentType != "" {
-		w.Header().Set("Content-Type", e.contentType)
+// gasFlight is one in-progress upstream fetch; done closes once result is set.
+type gasFlight struct {
+	done   chan struct{}
+	result gasResult
+}
+
+// gasResult is one gas read as the relay answers it: failed is a 502, and a
+// positive maxAge is the freshness left (whole seconds) on a cacheable 200.
+type gasResult struct {
+	failed      bool
+	status      int
+	contentType string
+	body        []byte
+	maxAge      int64
+}
+
+func newGasReader(client *http.Client, cache *ttlCache, safeguards *relaySafeguards) *gasReader {
+	return &gasReader{client: client, cache: cache, safeguards: safeguards, flights: make(map[string]*gasFlight)}
+}
+
+// serve answers a validated gas read for the canonical target, from the cache
+// within the API's freshness, otherwise from a (possibly shared) fetch.
+func (g *gasReader) serve(target string, w http.ResponseWriter, r *http.Request) {
+	if !g.safeguards.allowBucket(bucketGas, r.RemoteAddr, time.Now()) {
+		w.Header().Set("Retry-After", "60")
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
 	}
-	if e.cacheCtl != "" {
-		w.Header().Set("Cache-Control", e.cacheCtl)
+	if e, ok := g.cache.get(target); ok {
+		writeGasRead(w, gasResult{status: e.status, contentType: e.contentType, body: e.body, maxAge: int64(e.expiresAt.Sub(timeNow()) / time.Second)})
+		return
 	}
-	age := timeNow().Sub(e.storedAt)
-	if age < 0 {
-		age = 0
+	var flight = g.join(target)
+	select {
+	case <-flight.done:
+		writeGasRead(w, flight.result)
+	case <-r.Context().Done():
+		// The caller left; the shared fetch still completes for the others.
+		writeGasRead(w, gasResult{failed: true})
 	}
-	w.Header().Set("Age", strconv.Itoa(int((e.upstreamAge+age)/time.Second)))
-	w.WriteHeader(e.status)
-	_, _ = w.Write(e.body)
+}
+
+// join returns the in-progress fetch for target, starting one if there is
+// none. The fetch is detached from any one caller (it is bounded by
+// upstreamTimeout), so a caller that leaves does not fail the others.
+func (g *gasReader) join(target string) *gasFlight {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if flight, ok := g.flights[target]; ok {
+		return flight
+	}
+	var flight = &gasFlight{done: make(chan struct{})}
+	g.flights[target] = flight
+	go func() {
+		// fetch caches a fresh 200 before the flight ends, so a request that
+		// misses the flight finds the cache.
+		flight.result = g.fetch(target)
+		g.mu.Lock()
+		delete(g.flights, target)
+		g.mu.Unlock()
+		close(flight.done)
+	}()
+	return flight
+}
+
+// fetch performs one identity-free upstream GET. Gas reads relay API errors
+// through (uncached), unlike the stricter proxyGet in relay.go, but fail
+// closed on anything ambiguous: a redirect (never followed, its Location
+// never relayed), an informational status, or a body that is over maxBody,
+// truncated or cut by a read error is a 502, never a (cacheable) 200.
+func (g *gasReader) fetch(target string) gasResult {
+	var ctx, cancel = context.WithTimeout(context.Background(), upstreamTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return gasResult{failed: true}
+	}
+	// Explicitly suppress the default Go User-Agent so the API sees no
+	// user-agent field even though the caller's headers were already omitted.
+	req.Header.Set("User-Agent", "")
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return gasResult{failed: true}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || (resp.StatusCode >= 300 && resp.StatusCode < 400) || resp.ContentLength > maxBody {
+		return gasResult{failed: true}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	if err != nil || len(body) > maxBody || (resp.ContentLength >= 0 && int64(len(body)) != resp.ContentLength) {
+		return gasResult{failed: true}
+	}
+	var result = gasResult{status: resp.StatusCode, contentType: resp.Header.Get("Content-Type"), body: body}
+	if resp.StatusCode != http.StatusOK {
+		// Never cache an error, here or downstream (CDN, browser): the next
+		// request must reach the API again.
+		return result
+	}
+	if ttl := gasFreshness(resp.Header); ttl > 0 {
+		var now = timeNow()
+		result.maxAge = int64(ttl / time.Second)
+		g.cache.put(target, cacheEntry{status: resp.StatusCode, body: body, contentType: result.contentType, storedAt: now, expiresAt: now.Add(ttl)})
+	}
+	return result
+}
+
+// gasFreshness is the shared-cache freshness left on a 200 gas read: s-maxage
+// (max-age only when s-maxage is absent) minus Age. Zero means no-store: Vary
+// "*", no-store/no-cache/private (with or without a field list), a missing,
+// malformed, repeated or zero lifetime, or an invalid or exhausted Age. Other
+// Vary values are dropped: the relay sends the API the same headers for every
+// caller. Keep in sync with remainingFreshness in worker/src/index.ts.
+func gasFreshness(header http.Header) time.Duration {
+	for _, value := range strings.Split(strings.Join(header.Values("Vary"), ","), ",") {
+		if strings.TrimSpace(value) == "*" {
+			return 0
+		}
+	}
+	var ttl, ok = cacheTTL(strings.Join(header.Values("Cache-Control"), ","))
+	var age, ageOK = upstreamAge(strings.Join(header.Values("Age"), ", "))
+	if !ok || !ageOK || age >= ttl {
+		return 0
+	}
+	return ttl - age
+}
+
+// writeGasRead answers with rebuilt headers only: the upstream Content-Type
+// and the freshness left as max-age (no Age, no Vary, cookies or tracing), so
+// a cache behind the relay never holds a read past the API's lifetime.
+func writeGasRead(w http.ResponseWriter, result gasResult) {
+	if result.failed {
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	if result.contentType != "" {
+		w.Header().Set("Content-Type", result.contentType)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if result.maxAge > 0 {
+		w.Header().Set("Cache-Control", "public, max-age="+strconv.FormatInt(result.maxAge, 10))
+	}
+	w.WriteHeader(result.status)
+	_, _ = w.Write(result.body)
 }

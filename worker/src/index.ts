@@ -36,8 +36,12 @@ const MAX_CONCURRENCY = 128;
 export const MAX_BUFFERED_WORK = 32 << 20;
 // Per-route, per-source rate-limit buckets: PPOI sync (3 concurrent
 // 50-commitment batches) must not starve paymaster status polling, and vice versa.
-const BUCKET_LIMITS = { paymaster: 60, scheduler: 60, ppoi: 180 } as const;
-type Bucket = keyof typeof BUCKET_LIMITS;
+// The public gas reads have their own bucket (gas, cache hits included): the
+// SDK refreshes each chain every 10-30 s, so several wallets behind one address
+// fit while one source is held to 4 reads/s. Same budget as gas_reads.go.
+const BUCKET_LIMITS = { paymaster: 60, scheduler: 60, ppoi: 180, gas: 240 } as const;
+type RateBucket = keyof typeof BUCKET_LIMITS;
+type Bucket = Exclude<RateBucket, "gas">;
 // Per-route body caps; each request reserves buffer budget from ITS route's caps.
 // paymaster and scheduler match the backend gateway limits (decap.PaymasterRequestLimit
 // 1 MiB, SchedulerRequestLimit 4 MiB, ResponseLimit 1 MiB) and are unchanged.
@@ -64,6 +68,17 @@ export function bufferReservation(bucket: Bucket, gateway: boolean): number {
   const { request, response } = ROUTE_LIMITS[bucket];
   return (gateway ? 2 * request : 0) + 3 * response;
 }
+// Per-bucket shares of MAX_BUFFERED_WORK, so one route family (or one source
+// parking slow uploads in it) cannot answer "relay busy" for the others. PPOI
+// may hold at most half the pool (18 sealed requests); PPOI and scheduler
+// together never reach the last 10 MiB, which stays free for the paymaster
+// (two 5 MiB sealed /gateway requests). The paymaster may use the whole pool.
+export const PAYMASTER_BUFFER_FLOOR = 10 << 20;
+export const BUFFER_CEILINGS: Record<Bucket, number> = {
+  paymaster: MAX_BUFFERED_WORK,
+  scheduler: MAX_BUFFERED_WORK - PAYMASTER_BUFFER_FLOOR,
+  ppoi: MAX_BUFFERED_WORK / 2,
+};
 // Sealed routes nest above the backend gateway ladder (handler 25 s < forwarder
 // 28 s < gateway 30-35 s < relay 40 s); public reads and key configs keep 20 s.
 const SEALED_TIMEOUT_MS = 40_000;
@@ -219,17 +234,7 @@ function contentType(response: Response, expected: string): boolean {
 /** Rebuild cache metadata too: never copy Set-Cookie, tracing or identity headers. */
 function publicCacheControl(headers: Headers): string | undefined {
   if (headers.get("Vary")) return undefined;
-  const directives = (headers.get("Cache-Control") ?? "").toLowerCase().split(",").map(value => value.trim());
-  if (directives.some(value => ["no-store", "no-cache", "private"].includes(value.split("=")[0].trim()))) return undefined;
-  const max = directives.find(value => value.startsWith("s-maxage=")) ?? directives.find(value => value.startsWith("max-age="));
-  const text = max?.split("=")[1];
-  if (!text || !/^[0-9]+$/.test(text)) return undefined;
-  const ageText = headers.get("Age") ?? "0";
-  if (!/^[0-9]+$/.test(ageText)) return undefined;
-  const lifetime = Number(text);
-  const age = Number(ageText);
-  if (!Number.isSafeInteger(lifetime) || !Number.isSafeInteger(age)) return undefined;
-  const remaining = lifetime - age;
+  const remaining = remainingFreshness(headers);
   return remaining > 0 ? `public, max-age=${remaining}` : undefined;
 }
 
@@ -247,7 +252,12 @@ const CHAIN_QUERY_PATHS = new Set<string>([GAS_TIERS_PATH, GAS_HISTORY_PATH]);
 const GAS_FEE_PREFIX = "/api/v1/tx/gas-fee/";
 const GAS_READ_CHAINS = new Set<string>(["1", "56", "137", "42161"]);
 const MAX_GAS_READ_QUERY = 128;
-const NO_STORE: Record<string, string> = { "Cache-Control": "no-store" };
+const NO_STORE: Record<string, string> = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };
+// Internal to the edge cache: when a stored gas read stops being fresh (epoch
+// ms). Never served; a hit advertises only the seconds left until then.
+const GAS_EXPIRES_HEADER = "X-Relay-Expires";
+// The largest delta-seconds the relay accepts (one year, as in cache.go).
+const MAX_CACHE_AGE = 365 * 24 * 60 * 60;
 
 /**
  * The canonical upstream path + query of a gas read: `undefined` when the path
@@ -275,20 +285,44 @@ function gasReadTarget(url: URL): string | null | undefined {
   return undefined;
 }
 
+/** delta-seconds (RFC 9111 §1.2.2): plain digits only, at most MAX_CACHE_AGE. */
+function deltaSeconds(value: string | undefined): number | undefined {
+  if (value === undefined || !/^[0-9]+$/.test(value)) return undefined;
+  const seconds = Number(value);
+  return seconds <= MAX_CACHE_AGE ? seconds : undefined;
+}
+
 /**
  * Seconds of shared-cache freshness left on an upstream response: s-maxage (or
- * max-age) minus Age. 0 means it must not be stored or reused.
+ * max-age, only when s-maxage is absent) minus Age. 0 means it must not be
+ * stored or reused: Vary "*", no-store/no-cache/private (with or without a
+ * field list), a missing, malformed, repeated or zero lifetime, or an invalid
+ * or exhausted Age. Keep in sync with cacheTTL / gasFreshness in Go.
  */
 function remainingFreshness(headers: Headers): number {
   if ((headers.get("Vary") ?? "").split(",").some((value) => value.trim() === "*")) return 0;
-  const directives = (headers.get("Cache-Control") ?? "").toLowerCase().split(",").map((value) => value.trim());
-  if (directives.some((value) => ["no-store", "no-cache", "private"].includes(value.split("=")[0].trim()))) return 0;
-  const lifetime = (directives.find((value) => value.startsWith("s-maxage=")) ??
-    directives.find((value) => value.startsWith("max-age=")))?.split("=")[1];
-  const age = headers.get("Age") ?? "0";
-  if (!lifetime || !/^[0-9]+$/.test(lifetime) || !/^[0-9]+$/.test(age)) return 0;
-  const remaining = Number(lifetime) - Number(age);
-  return Number.isSafeInteger(remaining) && remaining > 0 ? remaining : 0;
+  const lifetimes: Record<string, number> = {};
+  for (const directive of (headers.get("Cache-Control") ?? "").toLowerCase().split(",")) {
+    const [rawName, ...value] = directive.trim().split("=");
+    const name = rawName.trim();
+    if (name === "no-store" || name === "no-cache" || name === "private") return 0;
+    if (name !== "s-maxage" && name !== "max-age") continue;
+    const seconds = deltaSeconds(value.length ? value.join("=") : undefined);
+    if (seconds === undefined || name in lifetimes) return 0;
+    lifetimes[name] = seconds;
+  }
+  const lifetime = lifetimes["s-maxage"] ?? lifetimes["max-age"];
+  const age = deltaSeconds(headers.get("Age") ?? "0");
+  if (lifetime === undefined || age === undefined) return 0;
+  return Math.max(lifetime - age, 0);
+}
+
+/** A gas-read answer with rebuilt headers only: no cookies, Vary, Age or tracing. */
+function gasReply(body: BodyInit | null, status: number, type: string | null, maxAge: number): Response {
+  const headers = new Headers(NO_STORE);
+  if (maxAge > 0) headers.set("Cache-Control", `public, max-age=${maxAge}`);
+  if (type) headers.set("Content-Type", type);
+  return withCors(new Response(body, { status, headers }));
 }
 
 // Workers refuse random values in global scope (deploy error 10021), so the
@@ -305,8 +339,17 @@ export function createRelayHandler(options: RelayOptions = {}) {
   const fetchUpstream = options.fetch ?? ((...args: Parameters<typeof fetch>) => globalThis.fetch(...args));
   let activeRequests = 0;
   let reservedBytes = 0;
+  const reservedBy: Record<Bucket, number> = { paymaster: 0, scheduler: 0, ppoi: 0 };
 
-  async function sourceAllowed(req: Request, bucket: Bucket): Promise<boolean> {
+  /** Whether the pool, the bucket's ceiling and the paymaster floor all admit a reservation. */
+  function bufferAvailable(bucket: Bucket, reservation: number): boolean {
+    if (reservedBytes + reservation > MAX_BUFFERED_WORK) return false;
+    if (reservedBy[bucket] + reservation > BUFFER_CEILINGS[bucket]) return false;
+    return bucket === "paymaster" ||
+      reservedBytes - reservedBy.paymaster + reservation <= MAX_BUFFERED_WORK - PAYMASTER_BUFFER_FLOOR;
+  }
+
+  async function sourceAllowed(req: Request, bucket: RateBucket): Promise<boolean> {
     const salt = isolateSalt();
     const now = Date.now();
     if (sourceWindows.size >= 10_000) {
@@ -333,52 +376,76 @@ export function createRelayHandler(options: RelayOptions = {}) {
 
   /**
    * Serve a validated gas read through the edge cache. A 200 is cached for what
-   * is left of the API's freshness (never extended); errors pass through with
-   * `no-store` and are never cached. Response headers are rebuilt: no cookies,
-   * Vary or tracing headers from the API reach the client or the cache.
+   * is left of the API's freshness (never extended), and a hit advertises only
+   * the seconds left since it was stored; errors pass through with `no-store`
+   * and are never cached. Anything ambiguous fails closed with a 502: a
+   * redirect, a transport error or timeout, or a body over MAX_BODY, truncated
+   * or cut by a read error. Response headers are rebuilt: no cookies, Vary or
+   * tracing headers from the API reach the client or the cache.
    */
-  async function gasRead(target: string, url: URL, env: Env, ctx: WorkerContext): Promise<Response> {
+  async function gasRead(target: string, url: URL, req: Request, env: Env, ctx: WorkerContext): Promise<Response> {
     const base = targetBase(env.TARGET);
     if (!base) return fail(503, "gateway unavailable");
     const cache = options.cache === undefined
       ? (globalThis as typeof globalThis & { caches?: { default?: RelayCache } }).caches?.default
       : options.cache;
     const cacheKey = new Request(url.origin + target, { method: "GET" });
-    const cached = await cache?.match(cacheKey);
-    if (cached) return withCors(cached);
-    let upstream: Response;
+    const cached = await cache?.match(cacheKey).catch(() => undefined);
+    if (cached) {
+      // Re-serving the stored max-age would let a cache behind the relay hold
+      // the read for up to twice the API's lifetime; a missing or spent expiry
+      // is a miss.
+      const left = Math.floor((Number(cached.headers.get(GAS_EXPIRES_HEADER)) - Date.now()) / 1000);
+      if (left > 0) return gasReply(cached.body, cached.status, cached.headers.get("Content-Type"), left);
+      void cached.body?.cancel().catch(() => {});
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort(req.signal.reason);
+    req.signal.addEventListener("abort", abort, { once: true });
+    if (req.signal.aborted) abort();
+    const timer = setTimeout(() => controller.abort(new Error("relay timeout")), options.timeoutMs ?? TIMEOUT_MS);
+    const signal = controller.signal;
     try {
-      upstream = await fetchUpstream(base + target, { headers: STRIP_IP_HEADERS, redirect: "manual" });
+      const upstream = await abortable(fetchUpstream(base + target, { headers: STRIP_IP_HEADERS, redirect: "manual", signal }), signal);
+      if (upstream.status < 200 || upstream.status >= 300 && upstream.status < 400) {
+        void upstream.body?.cancel().catch(() => {});
+        return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
+      }
+      const body = await readBounded(upstream.body, upstream.headers, MAX_BODY, signal, 502);
+      const fresh = upstream.status === 200 ? remainingFreshness(upstream.headers) : 0;
+      const contentType = upstream.headers.get("Content-Type");
+      if (cache && fresh > 0) {
+        const stored = new Headers({ "Cache-Control": `public, max-age=${fresh}`, [GAS_EXPIRES_HEADER]: String(Date.now() + fresh * 1000) });
+        if (contentType) stored.set("Content-Type", contentType);
+        ctx.waitUntil(cache.put(cacheKey, new Response(body as BodyInit, { status: 200, headers: stored })));
+      }
+      return gasReply(body as BodyInit, upstream.status, contentType, fresh);
     } catch {
       return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
+    } finally {
+      clearTimeout(timer);
+      req.signal.removeEventListener("abort", abort);
     }
-    if (upstream.status < 200 || upstream.status >= 300 && upstream.status < 400) {
-      void upstream.body?.cancel().catch(() => {});
-      return withCors(new Response("bad gateway", { status: 502, headers: NO_STORE }));
-    }
-    const fresh = upstream.status === 200 ? remainingFreshness(upstream.headers) : 0;
-    const headers = new Headers({
-      "Cache-Control": fresh > 0 ? `public, max-age=${fresh}` : "no-store",
-      "X-Content-Type-Options": "nosniff",
-    });
-    const contentType = upstream.headers.get("Content-Type");
-    if (contentType) headers.set("Content-Type", contentType);
-    const response = new Response(upstream.body, { status: upstream.status, headers });
-    if (cache && fresh > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    return withCors(response);
   }
 
   return {
     async fetch(req: Request, env: Env, ctx: WorkerContext): Promise<Response> {
       const url = new URL(req.url);
       const path = url.pathname;
-      // Public gas reads: validated, canonical, fresh-only; not behind the
-      // sealed-route limits (identity-free, cached for seconds).
+      // Public gas reads: validated, canonical, fresh-only, with their own
+      // per-source bucket; not behind the sealed-route buffer budget
+      // (identity-free, cached for seconds, bodies capped at MAX_BODY).
       const gasTarget = gasReadTarget(url);
-      if (gasTarget !== undefined && (req.method === "GET" || req.method === "OPTIONS")) {
+      if (gasTarget !== undefined) {
         if (req.method === "OPTIONS") return reply(null, 204);
+        if (req.method !== "GET") {
+          return withCors(new Response("method not allowed", { status: 405, headers: { ...NO_STORE, Allow: "GET, OPTIONS" } }));
+        }
         if (gasTarget === null) return withCors(new Response("invalid gas read", { status: 400, headers: NO_STORE }));
-        return gasRead(gasTarget, url, env, ctx);
+        if (!(await sourceAllowed(req, "gas"))) {
+          return withCors(new Response("rate limited", { status: 429, headers: { ...NO_STORE, "Retry-After": "60" } }));
+        }
+        return gasRead(gasTarget, url, req, env, ctx);
       }
       const scheduler = path === "/scheduler/ohttp-configs" || path === "/scheduler/gateway";
       const ppoi = path === "/ppoi/ohttp-configs" || path === "/ppoi/gateway";
@@ -408,11 +475,12 @@ export function createRelayHandler(options: RelayOptions = {}) {
       const { request: requestLimit, response: responseLimit } = ROUTE_LIMITS[bucket];
       const reservation = bufferReservation(bucket, gateway);
       if (activeRequests >= (options.maxConcurrency ?? MAX_CONCURRENCY) ||
-          reservedBytes + reservation > MAX_BUFFERED_WORK) return fail(503, "relay busy");
+          !bufferAvailable(bucket, reservation)) return fail(503, "relay busy");
 
       // Reserve before any awaits/body reads so slow uploads cannot evade the cap.
       activeRequests += 1;
       reservedBytes += reservation;
+      reservedBy[bucket] += reservation;
       const controller = new AbortController();
       const abort = () => controller.abort(req.signal.reason);
       req.signal.addEventListener("abort", abort, { once: true });
@@ -483,6 +551,7 @@ export function createRelayHandler(options: RelayOptions = {}) {
         req.signal.removeEventListener("abort", abort);
         activeRequests -= 1;
         reservedBytes -= reservation;
+        reservedBy[bucket] -= reservation;
       }
     },
   };
