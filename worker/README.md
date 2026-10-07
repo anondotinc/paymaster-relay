@@ -78,9 +78,14 @@ verification.
   `chain_id`) and nothing else; `gas-fee` accepts no query. Invalid requests get
   a `400 no-store` without reaching the API. Only the canonical target is
   forwarded and used as the edge-cache key; a `200` is cached for what is left
-  of the API's `s-maxage`/`max-age` after `Age`, errors are relayed `no-store`
-  and never cached, redirects become `502`, and cookies/`Vary`/tracing headers
-  are dropped. See the [root README](../README.md#endpoints).
+  of the API's `s-maxage`/`max-age` after `Age` (a hit advertises only the
+  seconds left since it was stored), errors are relayed `no-store` and never
+  cached, and cookies/`Vary`/tracing headers are dropped. Redirects, transport
+  errors, the 20 s timeout and bodies over 1 MiB, truncated or cut short
+  become `502 no-store`; methods other than `GET`/`OPTIONS` are a `405`. Gas
+  reads have their own per-source bucket (240 per minute). The rules are shared
+  with the Go relay through `testdata/gas_read_vectors.json`. See the
+  [root README](../README.md#endpoints).
 
 All responses include permissive CORS headers, and `OPTIONS` preflights on
 known routes are accepted, so browser clients can call the keyless relay. The
@@ -118,8 +123,9 @@ relay does not use cookies or browser credentials.
   `/gateway` into `503 relay busy`. POI sync runs 3 concurrent batches per
   client and the mobile app fires ~8 sealed requests at startup; both fit.
   Process-local, salted per-source buckets are kept per route: paymaster 60,
-  scheduler 60 and PPOI 180 requests per minute, so PPOI sync cannot starve
-  paymaster polling; this is load protection, not a global rate-limit guarantee.
+  scheduler 60, PPOI 180 and public gas reads 240 requests per minute, so PPOI
+  sync cannot starve paymaster polling; this is load protection, not a global
+  rate-limit guarantee.
 - Sealed responses and errors are `no-store`. Only validated public reads and
   signed configs can enter the edge cache, respecting the gateway's freshness
   directives and Age. Cache keys include target, service, and format version.
@@ -166,7 +172,8 @@ node --experimental-strip-types --test worker/test/*.test.mjs
 ```
 
 These tests (`relay.test.mjs` for the sealed routes and hardening,
-`gas-reads.test.mjs` for the public gas reads) exercise mocked fetch/cache and real in-memory streams. They do
+`ppoi.test.mjs` for the PPOI routes and buffer budget, `gas-reads.test.mjs` for
+the public gas reads and the shared `testdata/gas_read_vectors.json`) exercise mocked fetch/cache and real in-memory streams. They do
 **not** verify Cloudflare-added headers, deployed ingress rules, or production
 IP separation. Before activation, send synthetic canary identifiers through
 the intended deployment and verify removal before **every** gateway ingress
