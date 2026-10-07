@@ -141,7 +141,7 @@ test("shared gas-read vectors", async () => {
       };
       for (const attempt of [1, 2]) {
         const label = `${vector.name} (#${attempt})`;
-        const response = await send(req(vectors.path, { method: vector.method ?? "GET" }));
+        const response = await send(req(vector.path ?? vectors.path, { method: vector.method ?? "GET" }));
         assert.equal(response.status, vector.expect.status, label);
         assert.equal(response.headers.get("Cache-Control"), vector.expect.cacheControl, label);
         assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff", label);

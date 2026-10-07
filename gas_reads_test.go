@@ -299,6 +299,7 @@ type gasReadVectors struct {
 	Vectors []struct {
 		Name     string `json:"name"`
 		Method   string `json:"method"`
+		Path     string `json:"path"`
 		Upstream *struct {
 			Status        int               `json:"status"`
 			Headers       map[string]string `json:"headers"`
@@ -375,8 +376,12 @@ func TestGasReadVectors(t *testing.T) {
 		if method == "" {
 			method = http.MethodGet
 		}
+		var path = file.Path
+		if vector.Path != "" {
+			path = vector.Path
+		}
 		for attempt := 1; attempt <= 2; attempt++ {
-			var response = gasRead(handler, method, file.Path)
+			var response = gasRead(handler, method, path)
 			var header = response.Header()
 			if response.Code != vector.Expect.Status || header.Get("Cache-Control") != vector.Expect.CacheControl {
 				t.Errorf("%s (#%d): status %d, Cache-Control %q", vector.Name, attempt, response.Code, header.Get("Cache-Control"))
