@@ -1,5 +1,5 @@
 {
-  "comment": "Public gas-read rules shared by gas_reads_test.go and worker/test/gas-reads.test.mjs. Each vector sends the request twice (a fresh handler and cache per vector) with the upstream answering as given. Every answer must carry X-Content-Type-Options: nosniff and CORS, and never Location, Set-Cookie, Vary or Age. cached: the second request is served without a second upstream call. upstream.bodyBytes: a body of that many 'x' bytes; upstream.contentLength: the declared Content-Length when it differs from the body; upstream.bodyError: the body stream fails after its bytes. Ambiguous answers fail closed: 502 or no-store.",
+  "comment": "Public gas-read rules shared by gas_reads_test.go and worker/test/gas-reads.test.mjs. Each vector sends the request twice (a fresh handler and cache per vector) with the upstream answering as given. Every answer must carry X-Content-Type-Options: nosniff and CORS, and never Location, Set-Cookie, Vary or Age. cached: the second request is served without a second upstream call. upstream.bodyBytes: a body of that many 'x' bytes; upstream.contentLength: the declared Content-Length when it differs from the body; upstream.bodyError: the body stream fails after its bytes. path: the request path when it is not the file-level path (the rejections below; each is refused before any upstream call). Ambiguous answers fail closed: 502 or no-store.",
   "path": "/api/v1/tx/gas-fee/42161",
   "target": "/api/v1/tx/gas-fee/42161",
   "maxBody": 1048576,
@@ -144,6 +144,27 @@
       "expect": { "status": 405, "cacheControl": "no-store", "allow": "GET, OPTIONS", "upstreamCalls": 0 } },
     { "name": "PUT is refused without an upstream call",
       "method": "PUT",
-      "expect": { "status": 405, "cacheControl": "no-store", "allow": "GET, OPTIONS", "upstreamCalls": 0 } }
+      "expect": { "status": 405, "cacheControl": "no-store", "allow": "GET, OPTIONS", "upstreamCalls": 0 } },
+    { "name": "gas-fee on an unsupported chain is refused without an upstream call",
+      "path": "/api/v1/tx/gas-fee/10",
+      "expect": { "status": 400, "cacheControl": "no-store", "upstreamCalls": 0 } },
+    { "name": "gas-fee with any query is refused without an upstream call",
+      "path": "/api/v1/tx/gas-fee/42161?x=1",
+      "expect": { "status": 400, "cacheControl": "no-store", "upstreamCalls": 0 } },
+    { "name": "gas-tiers on an unsupported chain is refused without an upstream call",
+      "path": "/api/v1/paymaster/gas-tiers?chainId=10",
+      "expect": { "status": 400, "cacheControl": "no-store", "upstreamCalls": 0 } },
+    { "name": "gas-tiers with an extra field is refused without an upstream call",
+      "path": "/api/v1/paymaster/gas-tiers?chainId=42161&x=1",
+      "expect": { "status": 400, "cacheControl": "no-store", "upstreamCalls": 0 } },
+    { "name": "gas-tiers with a repeated chain is refused without an upstream call",
+      "path": "/api/v1/paymaster/gas-tiers?chainId=42161&chainId=42161",
+      "expect": { "status": 400, "cacheControl": "no-store", "upstreamCalls": 0 } },
+    { "name": "gas-tiers with no chain is refused without an upstream call",
+      "path": "/api/v1/paymaster/gas-tiers",
+      "expect": { "status": 400, "cacheControl": "no-store", "upstreamCalls": 0 } },
+    { "name": "gas-history with an unknown field name is refused without an upstream call",
+      "path": "/api/v1/paymaster/gas-history?chain=42161",
+      "expect": { "status": 400, "cacheControl": "no-store", "upstreamCalls": 0 } }
   ]
 }
