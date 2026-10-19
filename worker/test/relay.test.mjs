@@ -84,11 +84,15 @@ test("canonicalizes only protobuf public read fields", async () => {
   assert.equal((await send(req("/api/v1/paymaster/gas-quote?chainId=1&priority="))).status, 200);
   assert.equal(calls[1].url, env.TARGET + "/api/v1/paymaster/gas-quote?chainId=1");
   assert.equal((await send(req("/api/v1/paymaster/supported-tokens?chainId=56"))).status, 200);
+  assert.equal((await send(req("/api/v1/paymaster/gas-quote?chainId=8453&priority=Normal"))).status, 200);
+  assert.equal(calls.at(-1).url, env.TARGET + "/api/v1/paymaster/gas-quote?chainId=8453&priority=normal");
+  assert.equal((await send(req("/api/v1/paymaster/supported-tokens?chain_id=8453"))).status, 200);
+  assert.equal(calls.at(-1).url, env.TARGET + "/api/v1/paymaster/supported-tokens?chainId=8453");
 });
 
 test("rejects unknown, repeated, missing, or invalid public fields without an upstream call", async () => {
   const { send, calls } = fixture();
-  for (const query of ["", "chainId=1&address=identity", "chainId=1&chainId=1", "chain_id=1&chainId=1", "chainId=999", "chainId=-1", "chainId=1.0", "chainId=01", "chainId=1&priority=fast&priority=slow", "chainId=1&priority=tracking", "chainId=1&url=https://evil.invalid", "chainId=1;address=identity", "chainId=1" + "&".repeat(128)]) {
+  for (const query of ["", "chainId=1&address=identity", "chainId=1&chainId=1", "chain_id=1&chainId=1", "chainId=999", "chainId=10", "chainId=11155111", "chainId=-1", "chainId=1.0", "chainId=01", "chainId=08453", "chainId=%2B8453", "chainId=8453.0", "chainId=1&priority=fast&priority=slow", "chainId=1&priority=tracking", "chainId=1&url=https://evil.invalid", "chainId=1;address=identity", "chainId=1" + "&".repeat(128)]) {
     assert.equal((await send(req("/api/v1/paymaster/gas-quote?" + query))).status, 400, query);
   }
   assert.equal((await send(req("/api/v1/paymaster/supported-tokens?chainId=1&priority=fast"))).status, 400);

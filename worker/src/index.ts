@@ -88,7 +88,7 @@ const REQUEST_TYPE = "message/ohttp-req";
 const RESPONSE_TYPE = "message/ohttp-res";
 const QUOTE_PATH = "/api/v1/paymaster/gas-quote";
 const TOKENS_PATH = "/api/v1/paymaster/supported-tokens";
-const CHAINS = new Set(["1", "56", "137", "42161"]);
+const CHAINS = new Set(["1", "56", "137", "8453", "42161"]);
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -250,7 +250,7 @@ const GAS_TIERS_PATH = "/api/v1/paymaster/gas-tiers";
 const GAS_HISTORY_PATH = "/api/v1/paymaster/gas-history";
 const CHAIN_QUERY_PATHS = new Set<string>([GAS_TIERS_PATH, GAS_HISTORY_PATH]);
 const GAS_FEE_PREFIX = "/api/v1/tx/gas-fee/";
-const GAS_READ_CHAINS = new Set<string>(["1", "56", "137", "42161"]);
+const GAS_READ_CHAINS = new Set<string>(["1", "56", "137", "8453", "42161"]);
 const MAX_GAS_READ_QUERY = 128;
 const NO_STORE: Record<string, string> = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };
 // Internal to the edge cache: when a stored gas read stops being fresh (epoch

@@ -50,8 +50,8 @@ access to paymaster secrets.
   the API's network base fee. Both are public,
   identity-free and **fresh-only** (the API answers
   `Cache-Control: public, s-maxage=5, max-age=5`). They are strictly validated
-  before anything is forwarded: `<id>` must be exactly `1`, `56`, `137` or
-  `42161`; `gas-tiers` and `gas-history` take exactly one `chainId` (or its protobuf spelling
+  before anything is forwarded: `<id>` must be exactly `1`, `56`, `137`,
+  `8453` or `42161`; `gas-tiers` and `gas-history` take exactly one `chainId` (or its protobuf spelling
   `chain_id`) and no other field; `gas-fee` takes no query and one path segment.
   Anything else is a `400` (`404` for other paths), never cached. The relay
   forwards only the canonical target (`?chainId=<id>` / `/<id>`), so no caller
@@ -86,7 +86,7 @@ access to paymaster secrets.
 
 Only exact paths and declared methods are accepted, including preflights.
 Public reads require `chainId` (or the protobuf alias `chain_id`) equal to
-`1`, `56`, `137`, or `42161`. Gas quotes also accept optional `priority`:
+`1`, `56`, `137`, `8453`, or `42161`. Gas quotes also accept optional `priority`:
 `slow`, `normal`, or `fast` (case-insensitive; empty means the default).
 Duplicates, both chain spellings together, other fields, and query parameters
 on gateway/config/health paths are rejected before forwarding.

@@ -30,7 +30,7 @@ const (
 
 // gasReadChains are the chains the paymaster serves. Exact decimal strings, so
 // "01", "+1" or "1.0" never become an upstream URL or a cache key.
-var gasReadChains = map[string]bool{"1": true, "56": true, "137": true, "42161": true}
+var gasReadChains = map[string]bool{"1": true, "56": true, "137": true, "8453": true, "42161": true}
 
 // canonicalGasTiersQuery accepts exactly one chain field — chainId, or its
 // protobuf spelling chain_id — with an allowed value, and nothing else. It

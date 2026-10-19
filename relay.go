@@ -223,7 +223,7 @@ func canonicalPublicQuery(routePath, raw string) (string, error) {
 				return "", invalid
 			}
 			chain = items[0]
-			if chain != "1" && chain != "56" && chain != "137" && chain != "42161" {
+			if chain != "1" && chain != "56" && chain != "137" && chain != "8453" && chain != "42161" {
 				return "", invalid
 			}
 		case "priority":
