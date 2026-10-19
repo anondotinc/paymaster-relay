@@ -67,14 +67,14 @@ verification.
   `GET /api/v1/paymaster/supported-tokens?chainId=42161` remain available for
   compatibility. These public reads are **not sealed**. Only `chainId` (or the
   protobuf spelling `chain_id`) and optional quote `priority` are accepted.
-  Chains are exactly `1`, `56`, `137`, `42161` (no leading zeroes); priorities
+  Chains are exactly `1`, `56`, `137`, `8453`, `42161` (no leading zeroes); priorities
   are `slow`, `normal`, `fast` (case-insensitive). Raw public query strings are
   limited to 128 characters.
   Parameters are normalized before forwarding; unknown/duplicate parameters
   are rejected. No query parameters are accepted on other endpoints.
 - `GET /api/v1/paymaster/gas-tiers?chainId=<id>`, `GET /api/v1/paymaster/gas-history?chainId=<id>`
   and `GET /api/v1/tx/gas-fee/<id>` → the gas tiers, gas history and network base fee. Fresh-only public reads: `<id>` must be
-  `1`, `56`, `137` or `42161`; `gas-tiers` and `gas-history` accept exactly one `chainId` (or
+  `1`, `56`, `137`, `8453` or `42161`; `gas-tiers` and `gas-history` accept exactly one `chainId` (or
   `chain_id`) and nothing else; `gas-fee` accepts no query. Invalid requests get
   a `400 no-store` without reaching the API. Only the canonical target is
   forwarded and used as the edge-cache key; a `200` is cached for what is left

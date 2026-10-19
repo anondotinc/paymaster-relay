@@ -109,6 +109,11 @@ func TestPrivacyRejectsUnknownOrIdentifyingRequests(t *testing.T) {
 		{http.MethodGet, "/api/v1/paymaster/gas-quote?chainId=1&priority=secret", 400},
 		{http.MethodGet, "/api/v1/paymaster/supported-tokens?chainId=1&priority=fast", 400},
 		{http.MethodGet, "/api/v1/paymaster/gas-quote?chainId=999", 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-quote?chainId=10", 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-quote?chainId=08453", 400},
+		{http.MethodGet, "/api/v1/paymaster/gas-quote?chainId=%2B8453", 400},
+		{http.MethodGet, "/api/v1/paymaster/supported-tokens?chainId=08453", 400},
+		{http.MethodGet, "/api/v1/paymaster/supported-tokens?chain_id=8453&chainId=8453", 400},
 		{http.MethodGet, "/api/v1/paymaster/gas-quote", 400},
 		{http.MethodGet, "/ohttp-configs?account=secret", 400},
 		{http.MethodPost, "/gateway?target=https://attacker.test", 400},
@@ -136,6 +141,8 @@ func TestPrivacyPublicQueryCanonicalization(t *testing.T) {
 		{"chain_id=42161&priority=FAST", "chainId=42161&priority=fast"},
 		{"priority=&chainId=1", "chainId=1"},
 		{"chainId=137", "chainId=137"},
+		{"chainId=8453", "chainId=8453"},
+		{"chain_id=8453&priority=Normal", "chainId=8453&priority=normal"},
 	}
 	for _, testCase := range cases {
 		var result, err = canonicalPublicQuery(publicReadPaths[0], testCase.raw)

@@ -228,6 +228,8 @@ func TestPublicReadProxied(t *testing.T) {
 		paths    = []string{
 			"/api/v1/paymaster/gas-quote?chainId=1&priority=fast",
 			"/api/v1/paymaster/supported-tokens?chainId=1",
+			"/api/v1/paymaster/gas-quote?chainId=8453&priority=normal",
+			"/api/v1/paymaster/supported-tokens?chainId=8453",
 		}
 	)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
